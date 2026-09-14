@@ -5,6 +5,8 @@ require 'workflowmgr/bqs'
 require 'timeout'
 
 RSpec.describe WorkflowMgr::BQS do
+  subject(:bqs) { described_class.new(batch_system, 'fake.db', config) }
+
   let(:batch_system) do
     Class.new do
       def submit(_task)
@@ -14,13 +16,14 @@ RSpec.describe WorkflowMgr::BQS do
     end.new
   end
 
-  let(:config) { double('config', SubmitThreads: 4) }
+  # WorkflowYAMLConfig exposes PascalCase accessors (e.g. SubmitThreads); mirror that here.
+  # rubocop:disable Naming/MethodName
+  let(:config) { Struct.new(:SubmitThreads).new(4) }
+  # rubocop:enable Naming/MethodName
 
   def fake_task(name)
-    double('task', attributes: { name: name })
+    Struct.new(:attributes).new({ name: name })
   end
-
-  subject(:bqs) { described_class.new(batch_system, 'fake.db', config) }
 
   # Regression test for a deadlock where BatchQueueServer=false submissions
   # were joined via Thread.list, which blocks forever on the pool's idle

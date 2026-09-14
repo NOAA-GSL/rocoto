@@ -18,24 +18,29 @@ require 'workflowmgr/workflowsubsetoptions'
 # picks the wrong one for your cluster.
 RSpec.describe 'Slurm integration', :slurm do
   before do
-    skip 'sbatch not found on PATH; these specs require a real Slurm cluster' unless system('which sbatch > /dev/null 2>&1')
-  end
-
-  around do |example|
-    Dir.mktmpdir('rocoto_slurm_spec') do |dir|
-      @work_dir = dir
-      saved_home = ENV.fetch('HOME', nil)
-      ENV['HOME'] = File.join(dir, 'home')
-      FileUtils.mkdir_p(ENV['HOME'])
-      example.run
-      ENV['HOME'] = saved_home
+    unless system('which sbatch > /dev/null 2>&1')
+      skip 'sbatch not found on PATH; these specs require a real Slurm cluster'
     end
   end
+
+  let(:work_dir) { Dir.mktmpdir('rocoto_slurm_spec') }
+
+  around do |example|
+    saved_home = ENV.fetch('HOME', nil)
+    ENV['HOME'] = File.join(work_dir, 'home')
+    FileUtils.mkdir_p(ENV['HOME'])
+    example.run
+    ENV['HOME'] = saved_home
+  end
+
+  after { FileUtils.remove_entry(work_dir) }
 
   def detect_partition
     return ENV['ROCOTO_TEST_PARTITION'] if ENV['ROCOTO_TEST_PARTITION']
 
-    detected = `scontrol show partition 2>/dev/null`[/PartitionName=(\S+)/, 1] if system('which scontrol > /dev/null 2>&1')
+    if system('which scontrol > /dev/null 2>&1')
+      detected = `scontrol show partition 2>/dev/null`[/PartitionName=(\S+)/, 1]
+    end
 
     # Falls back to the partition name used by docker/docker-compose.yml's Slurm cluster
     detected || 'slurmpar'
@@ -73,14 +78,14 @@ RSpec.describe 'Slurm integration', :slurm do
   def write_workflow(path, log_dir, ntasks, partition:, account:)
     tasks = (1..ntasks).map do |i|
       <<~TASK
-          <task name="slurm_task_#{i}" maxtries="1">
-            <command>sleep 3; exit 0</command>
-            <cores>1</cores>
-            #{"<partition>#{partition}</partition>" if partition}
-            #{"<account>#{account}</account>" if account}
-            <walltime>2:00</walltime>
-            <jobname>slurm_task_#{i}</jobname>
-          </task>
+        <task name="slurm_task_#{i}" maxtries="1">
+          <command>sleep 3; exit 0</command>
+          <cores>1</cores>
+          #{"<partition>#{partition}</partition>" if partition}
+          #{"<account>#{account}</account>" if account}
+          <walltime>2:00</walltime>
+          <jobname>slurm_task_#{i}</jobname>
+        </task>
       TASK
     end.join
 
@@ -111,10 +116,10 @@ RSpec.describe 'Slurm integration', :slurm do
 
   it 'submits several tasks concurrently with BatchQueueServer=false and they all succeed' do
     ntasks = 3
-    log_dir = File.join(@work_dir, 'log')
+    log_dir = File.join(work_dir, 'log')
     FileUtils.mkdir_p(log_dir)
-    workflow_xml = File.join(@work_dir, 'workflow.xml')
-    db_path = File.join(@work_dir, 'rocoto.db')
+    workflow_xml = File.join(work_dir, 'workflow.xml')
+    db_path = File.join(work_dir, 'rocoto.db')
 
     write_workflow(workflow_xml, log_dir, ntasks, partition: detect_partition, account: detect_account)
     write_config(ENV.fetch('HOME'), batch_queue_server: false, submit_threads: ntasks)

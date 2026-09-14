@@ -18,16 +18,17 @@ RSpec.describe 'PBS Professional integration', :pbs do
     skip 'qsub not found on PATH; these specs require a real PBS cluster' unless system('which qsub > /dev/null 2>&1')
   end
 
+  let(:work_dir) { Dir.mktmpdir('rocoto_pbs_spec') }
+
   around do |example|
-    Dir.mktmpdir('rocoto_pbs_spec') do |dir|
-      @work_dir = dir
-      saved_home = ENV.fetch('HOME', nil)
-      ENV['HOME'] = File.join(dir, 'home')
-      FileUtils.mkdir_p(ENV['HOME'])
-      example.run
-      ENV['HOME'] = saved_home
-    end
+    saved_home = ENV.fetch('HOME', nil)
+    ENV['HOME'] = File.join(work_dir, 'home')
+    FileUtils.mkdir_p(ENV['HOME'])
+    example.run
+    ENV['HOME'] = saved_home
   end
+
+  after { FileUtils.remove_entry(work_dir) }
 
   def write_config(home_dir, batch_queue_server:, submit_threads:)
     config_dir = "#{home_dir}/.rocoto/#{WorkflowMgr.version}"
@@ -53,13 +54,13 @@ RSpec.describe 'PBS Professional integration', :pbs do
   def write_workflow(path, log_dir, ntasks)
     tasks = (1..ntasks).map do |i|
       <<~TASK
-          <task name="pbs_task_#{i}" maxtries="1">
-            <command>sleep 3; exit 0</command>
-            <nodes>1:ppn=1</nodes>
-            <queue>workq</queue>
-            <walltime>2:00</walltime>
-            <jobname>pbs_task_#{i}</jobname>
-          </task>
+        <task name="pbs_task_#{i}" maxtries="1">
+          <command>sleep 3; exit 0</command>
+          <nodes>1:ppn=1</nodes>
+          <queue>workq</queue>
+          <walltime>2:00</walltime>
+          <jobname>pbs_task_#{i}</jobname>
+        </task>
       TASK
     end.join
 
@@ -90,10 +91,10 @@ RSpec.describe 'PBS Professional integration', :pbs do
 
   it 'submits several tasks concurrently with BatchQueueServer=false and they all succeed' do
     ntasks = 3
-    log_dir = File.join(@work_dir, 'log')
+    log_dir = File.join(work_dir, 'log')
     FileUtils.mkdir_p(log_dir)
-    workflow_xml = File.join(@work_dir, 'workflow.xml')
-    db_path = File.join(@work_dir, 'rocoto.db')
+    workflow_xml = File.join(work_dir, 'workflow.xml')
+    db_path = File.join(work_dir, 'rocoto.db')
 
     write_workflow(workflow_xml, log_dir, ntasks)
     write_config(ENV.fetch('HOME'), batch_queue_server: false, submit_threads: ntasks)
