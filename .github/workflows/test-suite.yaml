@@ -95,7 +95,7 @@ jobs:
           docker compose -f docker-compose.yml config
           docker images
           docker ps -a
-          docker compose -f docker-compose.yml up -d
+          docker compose -f docker-compose.yml up -d --pull always --wait
       -
         name: Install Ruby ${{ matrix.ruby-version }} and dependencies
         run: |
@@ -212,7 +212,7 @@ jobs:
           docker compose -f docker-compose-pbs.yml config
           docker images
           docker ps -a
-          docker compose -f docker-compose-pbs.yml up -d
+          docker compose -f docker-compose-pbs.yml up -d --pull always --wait
       -
         name: Wait for PBS cluster to be ready
         run: |
@@ -223,6 +223,20 @@ jobs:
             [ "$free" -ge 3 ] && echo "All 3 nodes ready" && break
             sleep 5
           done
+      -
+        name: Check PBS frontend/server connectivity
+        if: always()
+        run: |
+          cd docker
+          docker compose -f docker-compose-pbs.yml ps
+          echo "--- getent hosts pbsserver (from frontend) ---"
+          docker exec rocoto-pbs-frontend bash -lc "getent hosts pbsserver" || true
+          echo "--- qstat -Bf (from frontend) ---"
+          docker exec rocoto-pbs-frontend bash -lc "qstat -Bf" || true
+          echo "--- pbsnodes -a (from frontend) ---"
+          docker exec rocoto-pbs-frontend bash -lc "pbsnodes -a" || true
+          echo "--- docker compose logs ---"
+          docker compose -f docker-compose-pbs.yml logs
       -
         name: Install Ruby ${{ matrix.ruby-version }} and dependencies
         run: |
@@ -270,6 +284,13 @@ jobs:
         name: Run PBS integration spec
         run: |
           docker exec rocoto-pbs-frontend bash -l -c "BUNDLE_CMD=\$(ruby -e \"require 'rubygems'; puts Gem.bin_path('bundler', 'bundle')\"); cd work; ROCOTO_RUN_PBS_SPECS=1 \$BUNDLE_CMD exec rspec --tag pbs"
+      -
+        name: Dump PBS cluster logs on failure
+        if: failure()
+        run: |
+          cd docker
+          docker compose -f docker-compose-pbs.yml ps
+          docker compose -f docker-compose-pbs.yml logs
 
   coverage:
     name: Test Coverage
