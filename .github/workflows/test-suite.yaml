@@ -99,7 +99,7 @@ jobs:
       -
         name: Install Ruby ${{ matrix.ruby-version }} and dependencies
         run: |
-          docker exec rocoto-frontend bash -c "sudo apt-get update && sudo apt-get install -y build-essential libssl-dev libreadline-dev zlib1g-dev libxml2-dev curl git"
+          docker exec rocoto-frontend bash -c "sudo apt-get update && sudo apt-get install -y build-essential libssl-dev libreadline-dev zlib1g-dev libxml2-dev libffi-dev libyaml-dev curl git"
           docker exec rocoto-frontend bash -c "git clone https://github.com/rbenv/ruby-build.git /tmp/ruby-build"
           docker exec rocoto-frontend bash -c "sudo /tmp/ruby-build/install.sh"
           docker exec rocoto-frontend bash -c '
@@ -216,7 +216,7 @@ jobs:
       -
         name: Install Ruby ${{ matrix.ruby-version }} and dependencies
         run: |
-          docker exec rocoto-pbs-frontend bash -c "sudo apt-get update && sudo apt-get install -y build-essential libssl-dev libreadline-dev zlib1g-dev libxml2-dev curl git"
+          docker exec rocoto-pbs-frontend bash -c "sudo apt-get update && sudo apt-get install -y build-essential libssl-dev libreadline-dev zlib1g-dev libxml2-dev libffi-dev libyaml-dev curl git"
           docker exec rocoto-pbs-frontend bash -c "git clone https://github.com/rbenv/ruby-build.git /tmp/ruby-build"
           docker exec rocoto-pbs-frontend bash -c "sudo /tmp/ruby-build/install.sh"
           docker exec rocoto-pbs-frontend bash -c '
