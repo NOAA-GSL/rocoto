@@ -538,12 +538,12 @@ module WorkflowMgr
                               "Forcibly submitting #{task.attributes[:name]}")
             end
 
-            # If we are not using a batch queue server, make sure all qsub threads are terminated before
-            # checking for job ids.
-            # Skip thread join in dryrun mode - thread pool workers sleep indefinitely waiting
-            # for work and cause deadlock
+            # If we are not using a batch queue server, shut down the pool, which blocks until
+            # this submission finishes running, before checking for job ids. submit() recreates
+            # the pool on the next iteration.
+            # Skip in dryrun mode - thread pool workers sleep indefinitely waiting for work and cause deadlock
             unless @config.BatchQueueServer || WorkflowMgr.dryrun_mode?
-              Thread.list.each { |t| t.join unless t == Thread.main }
+              @bq_server.shutdown
             end
 
             # Harvest job ids for submitted tasks
@@ -1913,10 +1913,11 @@ module WorkflowMgr
         end
       end
 
-      # If we are not using a batch queue server, make sure all qsub threads are terminated before checking for job ids
-      # Skip thread join in dryrun mode - thread pool workers sleep indefinitely waiting for work and cause deadlock
+      # If we are not using a batch queue server, shut down the pool, which blocks until all
+      # queued submissions have finished running, before checking for job ids.
+      # Skip in dryrun mode - thread pool workers sleep indefinitely waiting for work and cause deadlock
       unless @config.BatchQueueServer || WorkflowMgr.dryrun_mode?
-        Thread.list.each { |t| t.join unless t == Thread.main }
+        @bq_server.shutdown
       end
 
       # Harvest job ids for submitted tasks

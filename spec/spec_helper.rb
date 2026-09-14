@@ -78,6 +78,14 @@ RSpec.configure do |config|
     c.syntax = :expect
   end
 
+  # :pbs specs submit real jobs to a PBS Professional cluster and are opt-in.
+  # Run them explicitly with `bundle exec rspec --tag pbs` on a host with `qsub`.
+  config.filter_run_excluding pbs: true unless ENV['ROCOTO_RUN_PBS_SPECS']
+
+  # :slurm specs submit real jobs to a Slurm cluster and are opt-in.
+  # Run them explicitly with `bundle exec rspec --tag slurm` on a host with `sbatch`.
+  config.filter_run_excluding slurm: true unless ENV['ROCOTO_RUN_SLURM_SPECS']
+
   # Configure output format
   config.default_formatter = 'doc' if config.files_to_run.one?
 

@@ -134,6 +134,21 @@ module WorkflowMgr
 
     ##########################################
     #
+    # shutdown
+    #
+    ##########################################
+    def shutdown
+      return if @pool.nil?
+
+      # Gracefully stop the thread pool, waiting for any in-flight tasks to finish
+      @pool.shutdown
+
+      # Allow submit() to spawn a fresh pool the next time it's called
+      @pool = nil
+    end
+
+    ##########################################
+    #
     # method_missing
     #
     ##########################################
