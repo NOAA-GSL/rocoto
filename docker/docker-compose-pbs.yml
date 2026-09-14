@@ -9,7 +9,7 @@
 # merge this with `<<: *node-common` and then override the bits that differ
 # (container_name, hostname, environment).
 x-node-common: &node-common
-  image: ghcr.io/noaa-gsl/dockerpbscluster/pbs-mom:ubuntu-${UBUNTU_VERSION:-26.04}-openpbs-${OPENPBS_VERSION:-23.06.06}
+  image: ghcr.io/noaa-gsl/dockerpbscluster/pbs-mom:${PBS_IMAGE_TAG:-latest}
   shm_size: '4g'
   user: admin
   volumes:
@@ -29,7 +29,7 @@ x-node-common: &node-common
 
 services:
   pbsfrontend:
-    image: ghcr.io/noaa-gsl/dockerpbscluster/pbs-frontend:ubuntu-${UBUNTU_VERSION:-26.04}-openpbs-${OPENPBS_VERSION:-23.06.06}
+    image: ghcr.io/noaa-gsl/dockerpbscluster/pbs-frontend:${PBS_IMAGE_TAG:-latest}
     container_name: ${CLUSTER_NAME:-rocoto-pbs}-frontend
     shm_size: '4g'
     hostname: pbsfrontend
@@ -46,7 +46,7 @@ services:
       start_period: 5s
 
   pbsserver:
-    image: ghcr.io/noaa-gsl/dockerpbscluster/pbs-server:ubuntu-${UBUNTU_VERSION:-26.04}-openpbs-${OPENPBS_VERSION:-23.06.06}
+    image: ghcr.io/noaa-gsl/dockerpbscluster/pbs-server:${PBS_IMAGE_TAG:-latest}
     container_name: ${CLUSTER_NAME:-rocoto-pbs}-server
     shm_size: '4g'
     hostname: pbsserver
