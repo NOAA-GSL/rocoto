@@ -139,6 +139,127 @@ jobs:
         name: Run RSpec tests
         run: |
           docker exec rocoto-frontend bash -l -c "BUNDLE_CMD=\$(ruby -e \"require 'rubygems'; puts Gem.bin_path('bundler', 'bundle')\"); cd work; \$BUNDLE_CMD exec rake spec"
+      -
+        name: Run Slurm integration spec
+        run: |
+          docker exec rocoto-frontend bash -l -c "BUNDLE_CMD=\$(ruby -e \"require 'rubygems'; puts Gem.bin_path('bundler', 'bundle')\"); cd work; ROCOTO_RUN_SLURM_SPECS=1 \$BUNDLE_CMD exec rspec --tag slurm"
+
+  test-rocoto-pbs:
+    name: PBS Ruby ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      packages: write
+      contents: read
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ruby-version: '3.2.0'
+            label: '3.2.0 (minimum supported)'
+          - ruby-version: '3.2'
+            label: '3.2 (latest patch)'
+          - ruby-version: '3.3.0'
+            label: '3.3.0 (first release)'
+          - ruby-version: '3.3'
+            label: '3.3 (latest patch)'
+          - ruby-version: '3.4.1'
+            label: '3.4.1 (second release)'
+          - ruby-version: '3.4'
+            label: '3.4 (latest patch)'
+          - ruby-version: '4.0.0'
+            label: '4.0.0 (first release)'
+          - ruby-version: '4.0'
+            label: '4.0 (latest patch)'
+    steps:
+      -
+        name: Checkout repository
+        uses: actions/checkout@v4
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      -
+        name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          logout: false
+      -
+        name: Clean up any existing containers from previous runs
+        run: |
+          # Stop and remove any containers from previous runs
+          cd docker
+          docker compose -f docker-compose-pbs.yml down --remove-orphans --volumes || true
+      -
+        name: Prune pre-loaded GHA docker images
+        run: |
+          docker images
+          docker image prune -a -f
+          docker images
+      -
+        name: Start PBS cluster containers
+        run: |
+          cd docker
+          export DOCKER_CLIENT_TIMEOUT=600
+          export COMPOSE_HTTP_TIMEOUT=600
+          docker compose version
+          docker compose -f docker-compose-pbs.yml config
+          docker images
+          docker ps -a
+          docker compose -f docker-compose-pbs.yml up -d
+      -
+        name: Install Ruby ${{ matrix.ruby-version }} and dependencies
+        run: |
+          docker exec rocoto-pbs-frontend bash -c "sudo apt-get update && sudo apt-get install -y build-essential libssl-dev libreadline-dev zlib1g-dev libxml2-dev curl git"
+          docker exec rocoto-pbs-frontend bash -c "git clone https://github.com/rbenv/ruby-build.git /tmp/ruby-build"
+          docker exec rocoto-pbs-frontend bash -c "sudo /tmp/ruby-build/install.sh"
+          docker exec rocoto-pbs-frontend bash -c '
+            VERSION="${{ matrix.ruby-version }}";
+            if [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              # Full version specified (e.g., 3.2.0)
+              RUBY_VERSION=$VERSION;
+              INSTALL_DIR=/usr/local/ruby-${VERSION%.*};
+            else
+              # Minor version specified (e.g., 3.2), find latest patch
+              RUBY_VERSION=$(ruby-build --definitions | grep -E "^${VERSION}\.[0-9]+$" | tail -1);
+              INSTALL_DIR=/usr/local/ruby-$VERSION;
+            fi;
+            echo "Installing Ruby $RUBY_VERSION to $INSTALL_DIR";
+            sudo ruby-build $RUBY_VERSION $INSTALL_DIR;
+            sudo ln -sf $INSTALL_DIR/bin/ruby /usr/local/bin/ruby;
+            sudo ln -sf $INSTALL_DIR/bin/gem /usr/local/bin/gem;
+          '
+          docker exec rocoto-pbs-frontend bash -c "ruby --version"
+      -
+        name: Copy test files to work directory
+        run: |
+          docker exec rocoto-pbs-frontend bash -l -c "mkdir -p work; cd work; cp -r ../rocoto/* ."
+      -
+        name: Install rocoto
+        run: |
+          # Extract minor version (X.Y) from matrix version for directory path
+          MINOR_VERSION=$(echo "${{ matrix.ruby-version }}" | cut -d. -f1,2)
+          docker exec rocoto-pbs-frontend bash -l -c "cd work; ./INSTALL --with-ruby=/usr/local/ruby-${MINOR_VERSION} --local"
+          docker exec rocoto-pbs-frontend bash -l -c "cd work; ./UNINSTALL"
+          docker exec rocoto-pbs-frontend bash -l -c "cd work; ./INSTALL --with-ruby=/usr/local/ruby-${MINOR_VERSION}"
+      -
+        name: Run test suite
+        run: |
+          docker exec rocoto-pbs-frontend bash -l -c "cd work; bin/rocotorun -h"
+      -
+        name: Run RSpec tests
+        run: |
+          docker exec rocoto-pbs-frontend bash -l -c "BUNDLE_CMD=\$(ruby -e \"require 'rubygems'; puts Gem.bin_path('bundler', 'bundle')\"); cd work; \$BUNDLE_CMD exec rake spec"
+      -
+        name: Run PBS integration spec
+        run: |
+          docker exec rocoto-pbs-frontend bash -l -c "BUNDLE_CMD=\$(ruby -e \"require 'rubygems'; puts Gem.bin_path('bundler', 'bundle')\"); cd work; ROCOTO_RUN_PBS_SPECS=1 \$BUNDLE_CMD exec rspec --tag pbs"
 
   coverage:
     name: Test Coverage

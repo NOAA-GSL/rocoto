@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Container names are prefixed with CLUSTER_NAME (default "rocoto-pbs", so it
+# never collides with docker-compose.yml's Slurm cluster) so a second instance
+# can be started alongside this one without name collisions, e.g.:
+#   CLUSTER_NAME=rocoto-pbs2 docker compose -p rocoto-pbs2 -f docker-compose-pbs.yml up -d
+
+# Common configuration shared by all compute nodes. Individual node services
+# merge this with `<<: *node-common` and then override the bits that differ
+# (container_name, hostname, environment).
+x-node-common: &node-common
+  image: ghcr.io/noaa-gsl/dockerpbscluster/pbs-mom:ubuntu-${UBUNTU_VERSION:-26.04}-openpbs-${OPENPBS_VERSION:-23.06.06}
+  shm_size: '4g'
+  user: admin
+  volumes:
+    - pbs-home-vol:/home/admin
+    - pbs-opt-vol:/opt:ro
+    - ..:/home/admin/rocoto
+  depends_on:
+    pbsserver:
+      condition: service_started
+    pbsfrontend:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "ssh", "-o", "StrictHostKeyChecking=no", "admin@localhost", "hostname"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+
+services:
+  pbsfrontend:
+    image: ghcr.io/noaa-gsl/dockerpbscluster/pbs-frontend:ubuntu-${UBUNTU_VERSION:-26.04}-openpbs-${OPENPBS_VERSION:-23.06.06}
+    container_name: ${CLUSTER_NAME:-rocoto-pbs}-frontend
+    shm_size: '4g'
+    hostname: pbsfrontend
+    user: admin
+    volumes:
+      - pbs-home-vol:/home/admin
+      - pbs-opt-vol:/opt
+      - ..:/home/admin/rocoto
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ssh-ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+      start_period: 5s
+
+  pbsserver:
+    image: ghcr.io/noaa-gsl/dockerpbscluster/pbs-server:ubuntu-${UBUNTU_VERSION:-26.04}-openpbs-${OPENPBS_VERSION:-23.06.06}
+    container_name: ${CLUSTER_NAME:-rocoto-pbs}-server
+    shm_size: '4g'
+    hostname: pbsserver
+    user: admin
+    volumes:
+      - pbs-home-vol:/home/admin
+      - pbs-opt-vol:/opt:ro
+      - ..:/home/admin/rocoto
+    depends_on:
+      pbsfrontend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/pbs-server-ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+
+  pbsnode1:
+    <<: *node-common
+    container_name: ${CLUSTER_NAME:-rocoto-pbs}-node1
+    hostname: pbsnode1
+    environment:
+      - PBS_NODENAME=pbsnode1
+
+  pbsnode2:
+    <<: *node-common
+    container_name: ${CLUSTER_NAME:-rocoto-pbs}-node2
+    hostname: pbsnode2
+    environment:
+      - PBS_NODENAME=pbsnode2
+
+  pbsnode3:
+    <<: *node-common
+    container_name: ${CLUSTER_NAME:-rocoto-pbs}-node3
+    hostname: pbsnode3
+    environment:
+      - PBS_NODENAME=pbsnode3
+
+volumes:
+  pbs-home-vol:
+  pbs-opt-vol:
