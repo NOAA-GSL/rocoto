@@ -1,5 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Fixed project name so this cluster's default network/volumes never collide
+# with docker-compose-pbs.yml's, even if both are brought up without -p.
+name: rocoto-slurm
+
+# Container names are prefixed with CLUSTER_NAME (default "rocoto-slurm", so it
+# never collides with docker-compose-pbs.yml's PBS cluster) so a second instance
+# can be started alongside this one without name collisions, e.g.:
+#   CLUSTER_NAME=rocoto-slurm2 docker compose -p rocoto-slurm2 -f docker-compose.yml up -d
+
 # Common configuration shared by all compute nodes. Individual node services
 # merge this with `<<: *node-common` and then override the bits that differ
 # (container_name, hostname, environment).
@@ -26,7 +35,7 @@ x-node-common: &node-common
 services:
   slurmfrontend:
     image: ghcr.io/noaa-gsl/dockerslurmcluster/slurm-frontend:ubuntu-${UBUNTU_VERSION:-26.04}-slurm-${SLURM_VERSION:-25.11.5}
-    container_name: rocoto-frontend
+    container_name: ${CLUSTER_NAME:-rocoto-slurm}-frontend
     shm_size: '4g'
     hostname: slurmfrontend
     user: admin
@@ -34,8 +43,6 @@ services:
       - home-vol:/home/admin
       - opt-vol:/opt
       - ..:/home/admin/rocoto
-    ports:
-      - 8888:8888
     healthcheck:
       test: ["CMD", "test", "-f", "/tmp/ssh-ready"]
       interval: 5s
@@ -45,7 +52,7 @@ services:
 
   slurmmaster:
     image: ghcr.io/noaa-gsl/dockerslurmcluster/slurm-master:ubuntu-${UBUNTU_VERSION:-26.04}-slurm-${SLURM_VERSION:-25.11.5}
-    container_name: rocoto-master
+    container_name: ${CLUSTER_NAME:-rocoto-slurm}-master
     shm_size: '4g'
     hostname: slurmmaster
     user: admin
@@ -55,17 +62,13 @@ services:
       - ..:/home/admin/rocoto
     environment:
       - SLURM_CPUS_ON_NODE=8
-    ports:
-      - 6817:6817
-      - 6818:6818
-      - 6819:6819
     depends_on:
       slurmfrontend:
         condition: service_healthy
 
   slurmnode1:
     <<: *node-common
-    container_name: rocoto-node1
+    container_name: ${CLUSTER_NAME:-rocoto-slurm}-node1
     hostname: slurmnode1
     environment:
       - SLURM_NODENAME=slurmnode1
@@ -73,7 +76,7 @@ services:
 
   slurmnode2:
     <<: *node-common
-    container_name: rocoto-node2
+    container_name: ${CLUSTER_NAME:-rocoto-slurm}-node2
     hostname: slurmnode2
     environment:
       - SLURM_NODENAME=slurmnode2
@@ -81,7 +84,7 @@ services:
 
   slurmnode3:
     <<: *node-common
-    container_name: rocoto-node3
+    container_name: ${CLUSTER_NAME:-rocoto-slurm}-node3
     hostname: slurmnode3
     environment:
       - SLURM_NODENAME=slurmnode3
@@ -89,7 +92,7 @@ services:
 
   slurmnode4:
     <<: *node-common
-    container_name: rocoto-node4
+    container_name: ${CLUSTER_NAME:-rocoto-slurm}-node4
     hostname: slurmnode4
     environment:
       - SLURM_NODENAME=slurmnode4
@@ -97,7 +100,7 @@ services:
 
   slurmnode5:
     <<: *node-common
-    container_name: rocoto-node5
+    container_name: ${CLUSTER_NAME:-rocoto-slurm}-node5
     hostname: slurmnode5
     environment:
       - SLURM_NODENAME=slurmnode5

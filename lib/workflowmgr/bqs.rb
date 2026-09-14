@@ -54,7 +54,7 @@ module WorkflowMgr
     def submit(task, cycle)
       # Initialize hashes for this task
       @harvested[task.attributes[:name]] = {} if @harvested[task.attributes[:name]].nil?
-      @running[task.attributes[:name]] = {} if @status[task.attributes[:name]].nil?
+      @running[task.attributes[:name]] = {} if @running[task.attributes[:name]].nil?
       @status[task.attributes[:name]] = {} if @status[task.attributes[:name]].nil?
 
       # Dryrun: record status without spawning thread pool workers
@@ -130,6 +130,21 @@ module WorkflowMgr
       end
 
       false
+    end
+
+    ##########################################
+    #
+    # shutdown
+    #
+    ##########################################
+    def shutdown
+      return if @pool.nil?
+
+      # Gracefully stop the thread pool, waiting for any in-flight tasks to finish
+      @pool.shutdown
+
+      # Allow submit() to spawn a fresh pool the next time it's called
+      @pool = nil
     end
 
     ##########################################
