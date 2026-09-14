@@ -257,8 +257,8 @@ module WorkflowMgr
         # Get the active cycles
         load_active_cycles
 
-        # Get new cycles that need to be activated now
-        fetch_new_cycles
+        # Get new cycles that need to be activated now, unless in the harvest_only mode
+        fetch_new_cycles unless @options.harvest_only
 
         # Get the active jobs, which may include jobs from cycles that have just expired
         # as well as jobs needed for evaluating inter cycle dependencies
@@ -270,11 +270,11 @@ module WorkflowMgr
         # Deactivate completed cycles
         deactivate_done_cycles
 
-        # Expire active cycles that have exceeded the cycle life span
-        expire_cycles
+        # Expire active cycles that have exceeded the cycle life span, unless in the harvest_only mode
+        expire_cycles unless @options.harvest_only
 
-        # Submit new tasks where possible
-        submit_new_jobs
+        # Submit new tasks where possible, unless in the harvest_only mode
+        submit_new_jobs unless @options.harvest_only
 
         # Auto vacuum if necessary, but only for realtime mode
         auto_vacuum if @config.AutoVacuum && @realtime
@@ -1408,7 +1408,8 @@ module WorkflowMgr
           end
 
           # Can't check for hangs/expiration for jobs whose task is no longer defined
-          unless @tasks[job.task].nil?
+          #   nor in the harvest-only mode
+          unless @tasks[job.task].nil? || @options.harvest_only
 
             # Check for job hang
             if !@tasks[job.task].hangdependency.nil? && (job.state == "RUNNING")

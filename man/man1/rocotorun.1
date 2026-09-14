@@ -13,6 +13,7 @@
 .Op Fl h
 .Op Fl v Ar #
 .Op Fl -version
+.Op Fl -harvest-only
 .Fl d Ar database_file
 .Fl w Ar workflow_file
 .Sh DESCRIPTION
@@ -61,6 +62,8 @@ Only submit jobs for these tasks.  See
 .It Fl a, --all
 Include all tasks in the workflow subset.  See
 .Sx WORKFLOW SUBSETTING
+.It Fl -harvest-only
+Harvest the pending submissions without making any changes to the batch system.
 .El
 .Sh WORKFLOW SUBSETTING
 All Rocoto commands that monitor or modify the workflow can be told to

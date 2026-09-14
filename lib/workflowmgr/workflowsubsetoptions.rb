@@ -15,7 +15,7 @@ module WorkflowMgr
   class WorkflowSubsetOptions < WorkflowOption
     require 'workflowmgr/workflowselection'
 
-    attr_reader :database, :workflowdoc, :cycles, :tasks, :metatasks, :verbose
+    attr_reader :database, :workflowdoc, :cycles, :tasks, :metatasks, :verbose, :harvest_only
 
     ##########################################
     #
@@ -30,6 +30,7 @@ module WorkflowMgr
       @action = action # ie.: boot
       @all_tasks = false
       @all_cycles = false
+      @harvest_only = false
       @selection = nil
       super(args)
     end
@@ -100,6 +101,13 @@ module WorkflowMgr
       # Rewind all tasks for the specified cycles instead of a list of tasks:
       opts.on("-a", '--all', "Selects all tasks.") do |flag|
         @all_tasks = true
+      end
+
+      # Harvest without making any changes to the batch system (rocotorun only)
+      if @name == 'rocotorun'
+        opts.on("--harvest-only", "Harvest pending submissions without making any changes to the batch system") do
+          @harvest_only = true
+        end
       end
     end
 
