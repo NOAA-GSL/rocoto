@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Fixed project name so this cluster's default network/volumes never collide
+# with docker-compose.yml's, even if both are brought up without -p.
+name: rocoto-pbs
+
 # Container names are prefixed with CLUSTER_NAME (default "rocoto-pbs", so it
 # never collides with docker-compose.yml's Slurm cluster) so a second instance
 # can be started alongside this one without name collisions, e.g.:

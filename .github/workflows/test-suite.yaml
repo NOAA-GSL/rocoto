@@ -78,7 +78,7 @@ jobs:
         run: |
           # Stop and remove any containers from previous runs
           cd docker
-          docker compose -f docker-compose.yml down --remove-orphans --volumes || true
+          docker compose -f docker-compose.yml down --volumes || true
       -
         name: Prune pre-loaded GHA docker images
         run: |
@@ -99,10 +99,10 @@ jobs:
       -
         name: Install Ruby ${{ matrix.ruby-version }} and dependencies
         run: |
-          docker exec rocoto-frontend bash -c "sudo apt-get update && sudo apt-get install -y build-essential libssl-dev libreadline-dev zlib1g-dev libxml2-dev libffi-dev libyaml-dev curl git"
-          docker exec rocoto-frontend bash -c "git clone https://github.com/rbenv/ruby-build.git /tmp/ruby-build"
-          docker exec rocoto-frontend bash -c "sudo /tmp/ruby-build/install.sh"
-          docker exec rocoto-frontend bash -c '
+          docker exec rocoto-slurm-frontend bash -c "sudo apt-get update && sudo apt-get install -y build-essential libssl-dev libreadline-dev zlib1g-dev libxml2-dev libffi-dev libyaml-dev curl git"
+          docker exec rocoto-slurm-frontend bash -c "git clone https://github.com/rbenv/ruby-build.git /tmp/ruby-build"
+          docker exec rocoto-slurm-frontend bash -c "sudo /tmp/ruby-build/install.sh"
+          docker exec rocoto-slurm-frontend bash -c '
             VERSION="${{ matrix.ruby-version }}";
             if [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               # Full version specified (e.g., 3.2.0)
@@ -118,31 +118,31 @@ jobs:
             sudo ln -sf $INSTALL_DIR/bin/ruby /usr/local/bin/ruby;
             sudo ln -sf $INSTALL_DIR/bin/gem /usr/local/bin/gem;
           '
-          docker exec rocoto-frontend bash -c "ruby --version"
+          docker exec rocoto-slurm-frontend bash -c "ruby --version"
       -
         name: Copy test files to work directory
         run: |
-          docker exec rocoto-frontend bash -l -c "mkdir -p work; cd work; cp -r ../rocoto/* ."
+          docker exec rocoto-slurm-frontend bash -l -c "mkdir -p work; cd work; cp -r ../rocoto/* ."
       -
         name: Install rocoto
         run: |
           # Extract minor version (X.Y) from matrix version for directory path
           MINOR_VERSION=$(echo "${{ matrix.ruby-version }}" | cut -d. -f1,2)
-          docker exec rocoto-frontend bash -l -c "cd work; ./INSTALL --with-ruby=/usr/local/ruby-${MINOR_VERSION} --local"
-          docker exec rocoto-frontend bash -l -c "cd work; ./UNINSTALL"
-          docker exec rocoto-frontend bash -l -c "cd work; ./INSTALL --with-ruby=/usr/local/ruby-${MINOR_VERSION}"
+          docker exec rocoto-slurm-frontend bash -l -c "cd work; ./INSTALL --with-ruby=/usr/local/ruby-${MINOR_VERSION} --local"
+          docker exec rocoto-slurm-frontend bash -l -c "cd work; ./UNINSTALL"
+          docker exec rocoto-slurm-frontend bash -l -c "cd work; ./INSTALL --with-ruby=/usr/local/ruby-${MINOR_VERSION}"
       -
         name: Run test suite
         run: |
-          docker exec rocoto-frontend bash -l -c "cd work; bin/rocotorun -h"
+          docker exec rocoto-slurm-frontend bash -l -c "cd work; bin/rocotorun -h"
       -
         name: Run RSpec tests
         run: |
-          docker exec rocoto-frontend bash -l -c "BUNDLE_CMD=\$(ruby -e \"require 'rubygems'; puts Gem.bin_path('bundler', 'bundle')\"); cd work; \$BUNDLE_CMD exec rake spec"
+          docker exec rocoto-slurm-frontend bash -l -c "BUNDLE_CMD=\$(ruby -e \"require 'rubygems'; puts Gem.bin_path('bundler', 'bundle')\"); cd work; \$BUNDLE_CMD exec rake spec"
       -
         name: Run Slurm integration spec
         run: |
-          docker exec rocoto-frontend bash -l -c "BUNDLE_CMD=\$(ruby -e \"require 'rubygems'; puts Gem.bin_path('bundler', 'bundle')\"); cd work; ROCOTO_RUN_SLURM_SPECS=1 \$BUNDLE_CMD exec rspec --tag slurm"
+          docker exec rocoto-slurm-frontend bash -l -c "BUNDLE_CMD=\$(ruby -e \"require 'rubygems'; puts Gem.bin_path('bundler', 'bundle')\"); cd work; ROCOTO_RUN_SLURM_SPECS=1 \$BUNDLE_CMD exec rspec --tag slurm"
 
   test-rocoto-pbs:
     name: PBS Ruby ${{ matrix.label }}
@@ -195,7 +195,7 @@ jobs:
         run: |
           # Stop and remove any containers from previous runs
           cd docker
-          docker compose -f docker-compose-pbs.yml down --remove-orphans --volumes || true
+          docker compose -f docker-compose-pbs.yml down --volumes || true
       -
         name: Prune pre-loaded GHA docker images
         run: |
@@ -213,16 +213,6 @@ jobs:
           docker images
           docker ps -a
           docker compose -f docker-compose-pbs.yml up -d --pull always --wait
-      -
-        name: Wait for PBS cluster to be ready
-        run: |
-          echo "Waiting for PBS nodes to become free..."
-          for i in $(seq 1 60); do
-            free=$(docker exec rocoto-pbs-frontend bash -lc "pbsnodes -a 2>/dev/null | grep -c 'state = free' || echo 0" 2>/dev/null)
-            echo "Attempt $i: $free nodes free"
-            [ "$free" -ge 3 ] && echo "All 3 nodes ready" && break
-            sleep 5
-          done
       -
         name: Check PBS frontend/server connectivity
         if: always()
