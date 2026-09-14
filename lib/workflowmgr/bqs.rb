@@ -54,7 +54,7 @@ module WorkflowMgr
     def submit(task, cycle)
       # Initialize hashes for this task
       @harvested[task.attributes[:name]] = {} if @harvested[task.attributes[:name]].nil?
-      @running[task.attributes[:name]] = {} if @status[task.attributes[:name]].nil?
+      @running[task.attributes[:name]] = {} if @running[task.attributes[:name]].nil?
       @status[task.attributes[:name]] = {} if @status[task.attributes[:name]].nil?
 
       # Dryrun: record status without spawning thread pool workers
