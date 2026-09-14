@@ -214,6 +214,16 @@ jobs:
           docker ps -a
           docker compose -f docker-compose-pbs.yml up -d
       -
+        name: Wait for PBS cluster to be ready
+        run: |
+          echo "Waiting for PBS nodes to become free..."
+          for i in $(seq 1 60); do
+            free=$(docker exec rocoto-pbs-frontend bash -lc "pbsnodes -a 2>/dev/null | grep -c 'state = free' || echo 0" 2>/dev/null)
+            echo "Attempt $i: $free nodes free"
+            [ "$free" -ge 3 ] && echo "All 3 nodes ready" && break
+            sleep 5
+          done
+      -
         name: Install Ruby ${{ matrix.ruby-version }} and dependencies
         run: |
           docker exec rocoto-pbs-frontend bash -c "sudo apt-get update && sudo apt-get install -y build-essential libssl-dev libreadline-dev zlib1g-dev libxml2-dev libffi-dev libyaml-dev curl git"

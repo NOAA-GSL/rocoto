@@ -104,14 +104,21 @@ RSpec.describe 'PBS Professional integration', :pbs do
     Timeout.timeout(30) { run_engine(workflow_xml, db_path) }
 
     states = {}
-    Timeout.timeout(120) do
-      loop do
-        run_engine(workflow_xml, db_path)
-        states = job_states(db_path)
-        break if states.size == ntasks && states.values.all? { |s| %w[SUCCEEDED FAILED DEAD].include?(s) }
+    begin
+      Timeout.timeout(240) do
+        loop do
+          run_engine(workflow_xml, db_path)
+          states = job_states(db_path)
+          break if states.size == ntasks && states.values.all? { |s| %w[SUCCEEDED FAILED DEAD].include?(s) }
 
-        sleep 3
+          sleep 3
+        end
       end
+    rescue Timeout::Error
+      warn "Timed out waiting for jobs to reach a terminal state. states=#{states.inspect}"
+      warn `qstat -f 2>&1`
+      warn `pbsnodes -a 2>&1`
+      raise
     end
 
     expect(states.values).to all(eq('SUCCEEDED'))
