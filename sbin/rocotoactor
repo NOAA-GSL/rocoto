@@ -1,0 +1,48 @@
+#!/usr/bin/env ruby
+
+# Generic bootstrap for any WorkflowMgr::Actor. Given a class name, JSON
+# constructor args, and an inherited listening socket file descriptor, this
+# detaches from the parent's session/terminal, constructs the real object
+# fresh (only ever in this process), and serves it until told to stop or
+# until its parent disappears.
+#
+# Note: this deliberately does NOT use Process.daemon. Process.daemon forks
+# again internally and the calling process exits, which would hand the
+# actor's real work off to a grandchild whose pid the spawning Actor handle
+# never learns -- breaking its ability to track/reap this process. Since
+# fork+exec already gave us full process separation, only setsid + detaching
+# stdio is needed here, with no additional fork.
+
+rocoto_dir = File.expand_path("..", __dir__)
+require_relative "../bundle/bundler/setup"
+$LOAD_PATH.unshift("#{rocoto_dir}/lib")
+
+require "json"
+require "socket"
+require "workflowmgr/utilities"
+require "workflowmgr/actor"
+
+klass_name, source_file, args_json, fd, parent_pid = ARGV
+require source_file unless source_file.nil? || source_file.empty?
+real_class = Object.const_get(klass_name)
+args = JSON.parse(args_json)
+
+Process.setsid
+Dir.chdir("/")
+$stdin.reopen("/dev/null")
+$stdout.reopen("/dev/null", "a")
+$stderr.reopen("/dev/null", "a")
+
+server = UNIXServer.for_fd(fd.to_i)
+socket_path = server.addr[1]
+
+# Backstop: if our parent is gone (including a hard kill that gave it no
+# chance to send stop!), we must not outlive it. exit! bypasses serve's own
+# cleanup, so the socket file needs to be removed here too.
+WorkflowMgr::Actor.watch_parent!(parent_pid.to_i) do
+  File.delete(socket_path) if socket_path && File.exist?(socket_path)
+  exit!(0)
+end
+
+real_object = real_class.new(*args)
+WorkflowMgr::Actor.serve(server, real_object)
