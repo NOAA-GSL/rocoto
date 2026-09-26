@@ -129,10 +129,11 @@ class BrokerRestartTest < BrokerTestCase
   end
 
   def test_backoff_longer_than_the_window_cannot_defeat_the_restart_limit
-    # Backoff delays (0.3s, 0.6s) exceed the window (0.5s); under timestamp
-    # pruning the count would never reach max_restarts.
+    # Backoff delays (0.6s, 1.2s) exceed the window (1s); under timestamp pruning
+    # the count would never reach max_restarts. As above, the window also has to
+    # outlast the gap between :running and the next crash on a slow machine.
     actor = @broker.spawn(ExampleActor, "x", name: "x", restart: :on_failure, max_restarts: 2,
-                                             restart_window: 0.5, restart_backoff: 0.3)
+                                             restart_window: 1, restart_backoff: 0.6)
 
     3.times do |attempt|
       assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
@@ -146,12 +147,16 @@ class BrokerRestartTest < BrokerTestCase
   end
 
   def test_healthy_uptime_resets_the_restart_count
+    # The window must comfortably exceed the time a loaded machine takes between
+    # an incarnation becoming :running and its next crash being recorded: if the
+    # last crash lands outside it the count resets by design, the actor restarts
+    # again, and :failed never arrives. macOS CI failed here with 0.2s.
     actor = @broker.spawn(ExampleActor, "x", name: "x", restart: :on_failure, max_restarts: 1,
-                                             restart_window: 0.2, restart_backoff: 0.01)
+                                             restart_window: 1, restart_backoff: 0.01)
 
     assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
     wait_until { actor.state == :running && actor.generation == 2 }
-    sleep 0.4 # a full window of healthy running resets the count
+    sleep 1.2 # a full window of healthy running resets the count
     assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
     wait_until { actor.state == :running && actor.generation == 3 }
 
@@ -354,7 +359,12 @@ class BrokerRestartTest < BrokerTestCase
   end
 
   def test_relaunch_that_cannot_launch_counts_as_a_failure
-    actor = @broker.spawn(ExampleActor, "x", name: "x", restart: :on_failure, max_restarts: 1, restart_backoff: 0.01)
+    # Its own broker, so the simulated failure is captured rather than warned to
+    # stderr by the default handler, where it reads like real descriptor
+    # exhaustion in a CI log and sends the next reader chasing it.
+    reported = []
+    broker = RocotoActor::ActorBroker.new(error_handler: ->(error, context) { reported << [error.class, context] })
+    actor = broker.spawn(ExampleActor, "x", name: "x", restart: :on_failure, max_restarts: 1, restart_backoff: 0.01)
     launcher = RocotoActor.const_get(:Launcher)
 
     launcher.stub(:launch, ->(*) { raise Errno::EMFILE, "too many open files" }) do
@@ -362,8 +372,11 @@ class BrokerRestartTest < BrokerTestCase
       wait_until { actor.state == :failed }
     end
 
+    assert_equal [[Errno::EMFILE, "relaunch of x"]], reported
     assert_equal 1, actor.generation
     assert_raises(RocotoActor::ActorFailedError) { actor.ask("gone") }
+  ensure
+    broker&.stop(timeout: 2, force: true)
   end
 
   def test_diagnostics_report_the_most_recent_incarnation
