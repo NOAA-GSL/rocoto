@@ -74,6 +74,8 @@ Actors process one message at a time. `ask` serializes and places a message in a
 
 Actors run in fresh Ruby processes. The actor class must be named and defined in a dedicated file that can be loaded independently without starting the application or performing other process-wide side effects. `spawn` normally locates the defining file automatically, or it can be specified with `broker.spawn(Worker, source: "/path/to/worker.rb")`. The startup exchange has a five-second deadline by default; use `start_timeout:` to change it.
 
+Only that one file is loaded into the new process, and a new process inherits the application's environment but not its in-process `$LOAD_PATH`. If the actor's file requires other application code, those requires must resolve on their own: through `RUBYLIB`, through Bundler (a child inherits `RUBYOPT` and `BUNDLE_GEMFILE`, so it resolves the same bundle), or by the file setting up its own load path before requiring. This matters most when the library is vendored inside a larger application whose load path is built at runtime.
+
 Only the actor's Unix socket is passed into the new process, avoiding inherited Ruby locks, threads, connections, and unrelated file descriptors. Standard input, output, and error are connected to `/dev/null`; actors should return diagnostics through the protocol or use an explicitly configured logging destination.
 
 Each actor has a small watchdog process that remains a normal child of the application and owns a dedicated process group containing the actor worker. The watchdog detects worker or application death and terminates the group, including subprocesses launched by the actor; it holds no restart policy, which belongs to the broker. Actors are not daemonized and do not call `setsid`. A subprocess that deliberately creates another session or process group escapes this containment.
@@ -275,4 +277,4 @@ SOAK_SECONDS=1800 bundle exec ruby -Ilib test/soak/soak.rb
 bundle exec ruby -Ilib test/validation/fault_matrix.rb
 ```
 
-CI runs lint and the suite on Ruby 3.2 through 3.4 on Ubuntu, plus Ruby 3.4 on macOS, and can run the soak on demand.
+CI runs lint and the suite on Ruby 3.3 and 3.4 on Ubuntu, plus Ruby 3.4 on macOS, and can run the soak on demand.

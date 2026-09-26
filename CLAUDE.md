@@ -27,6 +27,9 @@ constant.
   interleavings to trace. Reviews should cite its invariant numbers.
 - `docs/linux-validation.md` records the fault-matrix results and the accepted
   limitations (D state, process-group escape, `RLIMIT_NPROC`).
+- `docs/integration.md` is the brief for embedding this library in a larger
+  codebase: the child-process load-path contract, packaging options, and what
+  the host has to decide. Written to be read from the host repository.
 
 ## Conventions that matter for review
 

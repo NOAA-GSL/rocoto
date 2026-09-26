@@ -199,7 +199,7 @@ An Ubuntu container under Docker Desktop uses the Docker Linux VM kernel. It is 
 
 ## Supported Ruby versions
 
-The gem declares Ruby `>= 3.2`. CI runs lint and the suite on 3.2, 3.3, and 3.4 on Ubuntu and on 3.4 on macOS. Differences in `Process.spawn`, `fork`, JSON, `Thread`, and signal behavior are especially relevant when adding a version.
+The gem declares Ruby `>= 3.3`. CI runs lint and the suite on 3.3 and 3.4 on Ubuntu and on 3.4 on macOS. Differences in `Process.spawn`, `fork`, JSON, `Thread`, and signal behavior are especially relevant when adding a version.
 
 ## Completion criteria
 
