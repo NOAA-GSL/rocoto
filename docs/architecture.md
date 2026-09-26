@@ -218,3 +218,7 @@ The chronological design, review, and validation record remains in
 [actor-broker-handoff.md](actor-broker-handoff.md). It is useful when tracing
 why a decision was made, but this document is the starting point for the
 current architecture.
+
+To embed this library in a larger codebase, read [integration.md](integration.md):
+the child-process load-path contract, the packaging options, and what the host
+has to decide.
