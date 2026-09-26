@@ -25,9 +25,13 @@ module RocotoActor
     end
 
     # Writes block until the frame is in the socket buffer; the sending side's
-    # mailbox bounds what can queue behind a blocked write.
+    # mailbox bounds what can queue behind a blocked write. The length header is
+    # a binary string and the payload is UTF-8, so they are written as two
+    # arguments rather than concatenated: joining them raises
+    # Encoding::CompatibilityError whenever both carry a byte above 0x7F, which
+    # is every multi-byte payload whose length happens to have a high byte.
     def write_payload(io, payload)
-      io.write([payload.bytesize].pack("N") << payload)
+      io.write([payload.bytesize].pack("N"), payload)
     end
 
     # Blocks until a whole frame arrives; nil at a clean end of stream. There is

@@ -126,6 +126,38 @@ class TransportTest < Minitest::Test
     assert_match(/UTF-8/, error.message)
   end
 
+  # The length header is binary and a multi-byte payload is UTF-8. Concatenating
+  # them raises Encoding::CompatibilityError whenever both hold a byte above
+  # 0x7F, so roughly half of all payload sizes used to fail while the same
+  # lengths in ASCII succeeded. The sweep has to cross the 0x80 boundaries: a
+  # single short sample passes either way.
+  def test_multibyte_payloads_round_trip_at_every_frame_length
+    failures = (1..400).reject do |length|
+      io = StringIO.new(+"".b)
+      message = { op: :ask, message: "é" * length }
+      TRANSPORT.write(io, message)
+      io.rewind
+      TRANSPORT.read(io) == message
+    rescue StandardError
+      false
+    end
+
+    assert_empty failures.first(10), "multi-byte payloads failed at #{failures.size} of 400 lengths"
+  end
+
+  def test_multibyte_strings_keep_their_encoding_and_bytes
+    io = StringIO.new(+"".b)
+    text = "café naïve — ☕ 日本語 🧪 #{'padding ünicode ' * 12}"
+
+    TRANSPORT.write(io, { op: :ask, message: text })
+    io.rewind
+    decoded = TRANSPORT.read(io)[:message]
+
+    assert_equal Encoding::UTF_8, decoded.encoding
+    assert_equal text, decoded
+    assert_equal text.bytes, decoded.bytes
+  end
+
   def test_json_codec_rejects_cycles
     value = []
     value << value

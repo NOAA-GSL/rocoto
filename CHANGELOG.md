@@ -20,6 +20,11 @@ First release. Requires Ruby >= 3.3.
 - `handle.ask` returns a `RocotoActor::Future`; `handle.tell` is one-way and
   carries the sender's handle. Delivery is at-most-once and nothing is retried.
 - Actors form a logical hierarchy with paths. A child never outlives its parent.
+- Messages, constructor arguments, actor names, and error text may contain any
+  valid UTF-8, including multi-byte characters, and round-trip byte for byte in
+  every direction at every frame length. A value that is not valid UTF-8, or is
+  otherwise not serializable, raises `SerializationError` instead of corrupting
+  the stream.
 
 ### Inside an actor
 

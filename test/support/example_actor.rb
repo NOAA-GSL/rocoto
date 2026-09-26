@@ -30,6 +30,12 @@ class ExampleActor
     when :stdio_isolated
       null = File.stat(File::NULL)
       [$stdin, $stdout, $stderr].all? { |io| io.stat.rdev == null.rdev }
+    when Hash
+      # Lets a caller put its own text, including multi-byte characters, into
+      # the failure path and so into the RemoteError the caller sees.
+      raise ArgumentError, message.fetch(:raise) if message.key?(:raise)
+
+      "#{@prefix}: #{message}"
     else "#{@prefix}: #{message}"
     end
   end

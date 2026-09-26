@@ -525,6 +525,58 @@ A by-concern module split was considered and declined: the natural units
 would all need the broker's mutex and node graph passed around or reopened as
 mixins, which buys indirection rather than isolation. The banners do the work.
 
+## Multi-byte text: a defect the test suite could not see (2026-09-26)
+
+Prompted by a question about coverage: are there tests that send text like
+`"café naïve"` in every direction? There were none. A search for any non-ASCII
+byte across `lib/` and `test/` returned nothing, while the *invalid* UTF-8 case
+was covered thoroughly — `"\xFF".b` as an ask argument, as a result, in an
+exception message, in a tell, plus transport unit tests and a decoder fuzz
+probe. The well-covered case had masked the absence of the ordinary one.
+
+**The defect.** `Transport.write_payload` framed a message as
+`io.write([payload.bytesize].pack("N") << payload)`. `pack("N")` returns an
+ASCII-8BIT string and `JSON.generate` returns UTF-8 with raw multi-byte
+characters. Ruby refuses to concatenate two strings that both carry a byte
+above 0x7F, so the write raised `Encoding::CompatibilityError` whenever the
+payload held a multi-byte character *and* its length had a high byte. Sweeping
+400 payload sizes: 192 failed, 208 succeeded; the same lengths in ASCII always
+succeeded. An ask carrying `"café naïve"` serializes to 158 bytes, so it failed.
+
+**Why it hid.** Half of all lengths work, and short payloads always work
+because a small length header is pure ASCII. Any casual test with a short
+accented string passes. Nothing else in the suite used a non-ASCII byte.
+
+**The symptom was worse than the defect.** The failure happens on the writer
+thread, whose loop rescues only `IOError` and `SystemCallError`, so the thread
+died. The outbox then never drained: every later message to that actor timed
+out, not just the offending one. `error_handler` was never called, because this
+is not a broker thread, and the actor still reported `:running` and `alive?`,
+so no restart policy fired. One accented character could wedge a connection
+permanently and silently.
+
+**The fix** is to stop concatenating: `io.write([payload.bytesize].pack("N"),
+payload)`. Multi-argument `IO#write` emits them in sequence, which also removes
+a per-message string copy. The read side was already correct — `JSON.parse`
+returns properly tagged UTF-8 and values compare equal byte for byte.
+
+**Testing rule this produced.** A test for this class of bug must straddle the
+0x80 frame-length boundaries; a single short sample passes whether or not the
+bug is present. `test/transport_test.rb` sweeps 400 frame lengths, and
+`test/broker_unicode_test.rb` sends five lengths through each of nine
+directions: ask and reply, application tell, brokered ask between actors,
+brokered tell between actors, constructor arguments, names and paths, a raised
+message arriving as `RemoteError`, a scheduled message (scheduler thread), and
+a lifecycle event reason (event thread). Both were confirmed to fail against
+the old write before being accepted — the sweep reports 192 of 400 lengths, and
+seven of the nine end-to-end cases fail with timeouts and stopped actors.
+
+**The general lesson.** Coverage of the hostile input (invalid UTF-8) was
+mistaken for coverage of the input itself. When a suite tests only that bad
+values are rejected, check that some test also sends a good value of the same
+kind; here the encoding of every ordinary message was never exercised beyond
+ASCII.
+
 ## Immediate implementation plan
 
 ### 1. Stabilize the protocol (remaining items)
