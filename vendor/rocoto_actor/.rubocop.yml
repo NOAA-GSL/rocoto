@@ -1,5 +1,5 @@
 AllCops:
-  TargetRubyVersion: 3.2
+  TargetRubyVersion: 3.3
   NewCops: enable
   SuggestExtensions: false
   Exclude:
@@ -49,3 +49,4 @@ Naming/PredicateMethod:
     - stop_subtrees
     - expire
     - wait_for_exit
+    - boot_succeeded

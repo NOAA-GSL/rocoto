@@ -10,6 +10,8 @@ class SupervisorActor
   end
 
   def receive(message)
+    exit! 3 if message == :crash
+
     return "supervisor: #{message}" unless message.is_a?(Hash)
 
     case message.fetch(:op)
@@ -66,6 +68,19 @@ class DiesAfterBootActor
 
   def receive(_message)
     nil
+  end
+end
+
+# Boots normally until a flag file appears, then fails every initialize.
+class FlakyBootActor
+  def initialize(flag_path)
+    raise "boot refused while #{flag_path} exists" if File.exist?(flag_path)
+  end
+
+  def receive(message)
+    exit! 3 if message == :crash
+
+    :ok
   end
 end
 

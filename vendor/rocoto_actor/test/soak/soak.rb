@@ -255,9 +255,14 @@ class Soak
       %i[threads fds children rss_kb live_slots references futures handles].each do |metric|
         first = head.sum(&metric).fdiv(head.size)
         last = tail.sum(&metric).fdiv(tail.size)
+        # Threads, descriptors, and children are deterministic and must not
+        # drift at all. Futures and handles are in-flight objects whose count
+        # swings with load; references and terminal nodes are retained by
+        # design. A leak of futures would pin references too, so the strict
+        # check on references covers it.
         limit = case metric
-                when :rss_kb, :live_slots then (first * 1.25) + 20_000
-                when :references, :handles then first + 50 # terminal nodes are retained by design
+                when :rss_kb, :live_slots, :futures then (first * 1.25) + 20
+                when :references, :handles then first + 50
                 else first + 5
                 end
         problem("#{metric} trended upward: #{first.round(1)} -> #{last.round(1)}") if last > limit

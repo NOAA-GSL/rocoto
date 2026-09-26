@@ -1,5 +1,10 @@
 # ActorBroker Implementation Handoff
 
+> Historical design and validation record. For the current component model,
+> thread ownership, lock rules, and source map, start with
+> [architecture.md](architecture.md). This file preserves implementation
+> chronology and review findings.
+
 ## Purpose
 
 This document preserves the design discussion and current implementation state for adding process-isolated actor handles and a parent-owned actor broker to RocotoActor. It is intended for a future Copilot, Claude Code, or other coding session.
@@ -7,7 +12,7 @@ This document preserves the design discussion and current implementation state f
 ## Repository and baseline
 
 - Repository: `/home/admin/rocoto_actor`
-- Runtime used for validation: Ruby 3.4.10 on Linux (linuxkit); the gem requires Ruby >= 3.2 (raised from 3.1 on 2026-09-22 because 3.1 is end-of-life)
+- Runtime used for validation: Ruby 3.4.10 on Linux (linuxkit); the gem requires Ruby >= 3.3 (raised from 3.1 on 2026-09-22 and from 3.2 on 2026-09-26, as each reached end of life)
 - Existing actor model: one watchdog process group per actor, one Unix socket pair between the application and that actor, parent-side reader/writer/reaper threads, bounded outbound mailbox.
 - The previously identified concurrent `Reference#stop` race was fixed in `lib/rocoto_actor/reference.rb` and covered by `test_concurrent_stop_waits_for_existing_shutdown`.
 - Before the broker prototype, the suite passed with 35 runs and 70 assertions. The concurrent ask/stop and timeout/load stress probes passed.
@@ -81,7 +86,10 @@ The long-term preferred API is asynchronous `handle.ask`, returning a future tha
 
 ## Current prototype files
 
-- `lib/rocoto_actor/broker.rb`: `ActorBroker` registry and lifecycle nodes, bounded non-blocking routing, the service thread (route expiries and failure cleanup), and the lifecycle pool for actor-initiated spawn/stop.
+- `lib/rocoto_actor/broker.rb`: `ActorBroker` registry and lifecycle nodes, bounded non-blocking routing, and policy coordination.
+- `lib/rocoto_actor/event_dispatcher.rb`: ordered lifecycle event delivery and watcher notification thread.
+- `lib/rocoto_actor/deadline_scheduler.rb`: route expirations, timers, and delayed broker tasks.
+- `lib/rocoto_actor/lifecycle_executor.rb`: bounded actor-initiated spawn/stop and relaunch worker pool.
 - `lib/rocoto_actor/handle.rb`: `ActorHandle`; in the application it delegates to the broker, in an actor it sends requests through `BrokerClient`.
 - `lib/rocoto_actor/broker_client.rb`: worker-side per-socket request channel with unique request IDs and deferred frames.
 - `lib/rocoto_actor/context.rb`: `ActorContext`, exposed as `RocotoActor.context` inside an actor (`spawn`, `handle`, `schedule`).
@@ -90,8 +98,14 @@ The long-term preferred API is asynchronous `handle.ask`, returning a future tha
 - `lib/rocoto_actor/launcher.rb`: internal (`private_constant`) process launcher (`launch` returns `[reference, boot_future]`), startup error mapping, and process-group helpers used by `ActorBroker` and `Reference`.
 - `lib/rocoto_actor/runner.rb`: worker entry point; marks the worker process, builds the context from the boot message, marks the broker client ready after `:ready`, and runs the actor loop (`run_actor` drains deferred frames and flattens `RemoteError` provenance in `error_response`).
 - `lib/rocoto_actor/future.rb`: `on_resolve` callbacks and `expire` used by the broker to answer without a waiting thread.
-- `lib/rocoto_actor/transport.rb`: encodes handles as `['actor_handle', id]` and decodes them using the current transport thread's socket.
+- `lib/rocoto_actor/decode_bindings.rb`: explicitly binds decoded handles and timers to a broker, worker socket, or neither; no thread-local decode state.
+- `lib/rocoto_actor/transport.rb`: encodes handles as `['actor_handle', id]` and decodes capability values through explicit `DecodeBindings`.
 - `lib/rocoto_actor/reference.rb`: accepts broker requests from an actor and queues broker responses on the actor's existing writer, with an `on_done` callback per response for broker accounting.
+- `lib/rocoto_actor/actor_node.rb`: `ActorNode`, one actor's logical state (state, generation, spec, policy, restarts, failure, exit, timers, watchers) and the transitions over it; added by the simplification series.
+- `lib/rocoto_actor/spawn_options.rb`: the one parser and validator for spawn options, shared by `broker.spawn`, `context.spawn`, and the `broker_spawn` request.
+- `lib/rocoto_actor/process_budget.rb`: the `RLIMIT_NPROC` preflight; counts the user's tasks from `/proc` and refuses a launch that would not fit.
+- `lib/rocoto_actor/threads.rb`: `Threads.start`, the single creation site for every thread the library owns; turns `ThreadError` into `ResourceLimitError`.
+- `lib/rocoto_actor/error_reporting.rb`: `ErrorReporting.report`/`guard`, the one policy for reporting to `error_handler` from a broker thread without ever ending that thread.
 - `test/support/process_actor.rb`: contains `ForwardingActor` used by the broker test.
 - `test/support/supervisor_actor.rb`: `SupervisorActor`, `InitSpawnActor`, and `FailingInitSpawnActor` exercising `RocotoActor.context`.
 - `test/support/tell_actor.rb`: `CollectorActor` and `CoordinatorActor` exercising `tell`, `context.sender`, and failure in told messages.
@@ -150,6 +164,7 @@ Implementation progress:
 - [x] Define initial broker error semantics: errors preserve provenance through nested `RemoteError` wrappers; do not reconstruct arbitrary exception classes.
 - [x] Propagate per-call broker timeouts and cover a hanging target.
 - [x] Run the broker suite and full suite after the current changes.
+- [x] Extract mechanical broker executors: event delivery, deadlines, and lifecycle workers.
 - [x] Add an initial per-call timeout field and propagate it to the target future.
 - [x] Bound broker routing work with a finite dispatcher/request capacity (`max_routes`, `max_routes_per_actor`, `route_timeout`; no thread per route; one timer thread per broker).
 - [x] Flatten `RemoteError` provenance across hops; typed errors for unknown handle, stopped target, invalid timeout, and broker capacity.
@@ -160,6 +175,10 @@ Implementation progress:
 - [x] Add death notification (`context.watch`/`unwatch`, `:actor_event` tells; `ActorBroker.new(on_event:)`), a `shutdown` callback on graceful stop, synchronous-call deadlock detection (`DeadlockError`), and `broker.describe` (2026-09-23).
 - [x] Add self-scheduled tells (`context.schedule(message, after:, every:)` → `Timer#cancel`; broker-owned timers that die with the incarnation; undeliverable ticks dropped and reported).
 - [x] Add restart policies and generations (`restart: :never | :on_failure`, `max_restarts`, `restart_window`, `restart_backoff`; `:restarting` state; `ActorRestartingError`; `handle.generation`).
+- [x] Simplify after the reviews converged: six behavior-preserving steps (see below), each its own PR with lint, suite, fault matrix, and a 30-minute CI soak.
+- [x] Add the `RLIMIT_NPROC` preflight (`ProcessBudget`, `ResourceLimitError`, `ActorBroker.new(process_margin:)`, `describe[:process_limit]`).
+- [x] Decide what happens when a thread cannot be created anyway: fail that launch only. A broker-wide failure mode was built and removed (see below).
+- [x] Reorder `broker.rb` by concern with a reading guide (pure motion, method bodies byte-identical).
 
 The broker-focused command was run:
 
@@ -167,12 +186,19 @@ The broker-focused command was run:
 bundle exec ruby -Itest test/broker_test.rb
 ```
 
-Latest validation (2026-09-23):
+Latest validation (2026-09-26):
 
 ```text
-broker: 95 runs, 428 assertions, 0 failures, 0 errors
-full suite: 132 runs, 504 assertions, 0 failures, 0 errors
+full suite: 159 runs, 605 assertions, 0 failures, 0 errors
+fault matrix: 30 probes, 0 failed
+soak: SOAK_SECONDS=600 passed
 ```
+
+The broker tests were split by concern (`test/broker_routing_test.rb`,
+`broker_lifecycle_test.rb`, `broker_children_test.rb`, `broker_restart_test.rb`,
+`broker_tell_test.rb`, `broker_timer_test.rb`, `broker_events_test.rb`,
+`broker_limits_test.rb`), so there is no single `broker_test.rb` command any more;
+`bundle exec rake` is the gate.
 
 The outer caller sees the innermost remote class: a target `ArgumentError` arrives as `RemoteError` with `remote_class == "ArgumentError"` and `remote_message == "requested failure"`; a broker deadline arrives as `remote_class == "RocotoActor::AskTimeoutError"`; a stopped target as `"RocotoActor::ActorStoppedError"`; an over-capacity broker as `"RocotoActor::BrokerBusyError"`; an unknown handle as `"RocotoActor::Error"` with message `unknown actor handle`.
 
@@ -193,7 +219,7 @@ Remove generated `Gemfile.lock` if it is untracked and was created only by local
 - States: `:starting`, `:running`, `:stopping`, `:stopped`, `:failed`. A node is registered as `:starting` immediately after the process is launched and before its boot completes, so the actor can issue broker requests (including `context.spawn`) from `initialize`. `check_placement` is run before launch (cheap rejection) and again under the mutex at registration, so a parent stopped during the child's startup makes the child fail with `ActorStoppedError` and the child process is force-stopped.
 - Local handles no longer hold a `Reference`; every `ask`/`stop`/`alive?`/`state`/`path`/`parent`/`children` goes through the broker (`ActorHandle.new(id, broker:)`), which checks node state first. `ActorHandle#==` compares ids.
 - Stop order: descendants first, deepest first (post-order), then the node; one deadline shared across the subtree (`stop_subtrees`), falling back to `force: true` once the deadline passes. `broker.stop` applies the same to every root.
-- Failure: `Reference#on_exit` fires on the reaper thread. `actor_exited` marks the node `:stopped` if it was `:stopping`, else `:failed`, marks live descendants `:stopping`, and enqueues their force-stop on the broker service thread (the former timer thread now runs expiries and lifecycle tasks). The reaper thread never waits on another actor.
+- Failure: `Reference#on_exit` fires on the reaper thread. `actor_exited` marks the node `:stopped` if it was `:stopping`, else `:failed`, marks live descendants `:stopping`, and enqueues their force-stop on the broker service thread (the former timer thread now runs expirations and lifecycle tasks). The reaper thread never waits on another actor.
 - Names: unique among live siblings; may be reused after the sibling stops or fails. `children(handle)` returns only live children.
 - `ActorFailedError < ActorStoppedError` distinguishes a crash from an orderly stop for both local callers and brokered callers (`remote_class`).
 
@@ -202,17 +228,17 @@ Remove generated `Gemfile.lock` if it is untracked and was created only by local
 - Worker side: `RocotoActor.context` (`ActorContext`, `lib/rocoto_actor/context.rb`) is created by the runner from the boot message's `context: { actor_id: }`, which `ActorBroker` passes through a new `RocotoActor.spawn(context:)` keyword. `context.spawn(Class|"Name", *args, name:, source:, start_timeout:, mailbox_size:, mailbox_bytes:)` resolves the source path in the worker and sends `{ op: :broker_spawn, actor_class:, source:, arguments:, name:, options: }`. `context.handle` is the actor's own handle.
 - The process primitive is `RocotoActor::Launcher.spawn` (`lib/rocoto_actor/launcher.rb`), a `private_constant` called only by `ActorBroker#spawn_node` for both `broker.spawn` and `context.spawn`. There is no public `RocotoActor.spawn`; `ActorBroker` is the only way to create actors. The launcher accepts a class name string plus `source:`, so the broker never needs the child class loaded. `test/rocoto_actor_test.rb` reaches it through `RocotoActor.const_get(:Launcher)` to test `Reference` directly.
 - `BrokerClient` (`lib/rocoto_actor/broker_client.rb`) is one per socket in the worker; all handles and the context share its mutex and request counter, which closes the request-ID collision item. It holds the deferred non-response frames that `run_actor` drains. Requests are valid from the first frame because the parent's reader thread services the socket from the moment the process is launched.
-- Broker side: `Reference#read_replies` forwards every op in `ActorBroker::REQUEST_OPS` to `ActorBroker#dispatch`, which takes the per-source response slot then routes `:broker_request` inline and queues `:broker_spawn`/`:broker_stop` on a lifecycle pool (`max_lifecycle_workers`, lazily started; `max_pending_lifecycle_requests` queue bound rejecting with `BrokerBusyError`). Spawn blocks up to `start_timeout`, so it must not run on a reader thread or the service thread.
+- Broker side: `Reference#read_replies` uses `Protocol.broker_request?` to forward broker operations to `ActorBroker#dispatch`, which takes the per-source response slot then routes `:broker_request` inline and queues `:broker_spawn`/`:broker_stop` on a lifecycle pool (`max_lifecycle_workers`, lazily started; `max_pending_lifecycle_requests` queue bound rejecting with `BrokerBusyError`). Spawn blocks up to `start_timeout`, so it must not run on a reader thread or the service thread.
 - The source node is found through `@node_ids_by_reference`; an unregistered source gets `Error("unknown source actor")`. `spawn_child` validates types and restricts `options` to `SPAWN_OPTIONS` with numeric values; `source` must be absolute.
 - Worker-side `handle.stop(timeout:, force:)` sends `:broker_stop`; the broker only allows stopping descendants of the requester (`descendant?`), else `Error("... is not a descendant of ...")`.
-- Handles decoded in the application bind to the owning broker (`Thread.current[:rocoto_actor_broker]`, set on the reference reader thread by `attach_broker`), so a handle returned from an actor's reply is a fully local handle. Decoding in a worker (`RocotoActor.worker_process?`) binds to the socket as before.
+- Handles decoded in the application bind through the `DecodeBindings` owned by that `Reference`; `attach_broker` attaches the broker to the same bindings object created before the reader starts. Worker decoding uses socket-bound bindings owned by the per-socket `BrokerClient`. A handle returned from an actor reply is therefore fully local without thread-local state.
 - `ActorBroker#stop` fails any queued lifecycle requests with `ActorStoppedError` and joins the lifecycle workers; a spawn in progress completes and is rejected at registration because the broker is stopped.
 
 ### Boot protocol (implemented)
 
 - Boot is an ordinary correlated request. `Launcher.launch` forks, builds the `Reference` immediately, and calls `Reference#boot(arguments, context)`, which enqueues `{ op: :boot, id:, arguments:, context: }` (bypassing the mailbox bound) and returns `[reference, boot_future]`. The runner replies `{ id:, ok: true }` after `initialize` returns, or an `error_response` with the boot id on failure; a watchdog failure before the boot message is read sends a bare `op: :boot_error` frame, which the reader resolves against `@boot_id`. `Launcher.spawn` (launch + wait) remains for the low-level `Reference` tests only.
 - `ActorBroker#launch_node` registers the node as `:starting` (with `booting = true`), attaches the broker, and returns `[node, boot]`. Exactly one caller settles it via `settle_boot(node, error)`: success moves `:starting` to `:running`; failure kills the process (`stop(force: true, timeout: 0)`), `unregister`s the node (removed from `@nodes` and the parent's children, since no handle can exist for it), force-stops any children it spawned while booting on the service thread, and maps the error with `Launcher.startup_error` (`AskTimeoutError` becomes `TransportTimeoutError` "startup timed out"; `ActorStoppedError` becomes `Error` "closed during startup"; `RemoteError` passes through with the constructor's original class).
-- `broker.spawn(start_timeout:)` waits synchronously on the boot future. `spawn_child` (lifecycle pool) does not wait: it schedules an expiry for `start_timeout` on the service thread and responds from `boot.on_resolve`, so a chain of actors spawning in their constructors needs no thread per level (`test_nested_initialization_spawning_is_not_limited_by_the_lifecycle_pool`).
+- `broker.spawn(start_timeout:)` waits synchronously on the boot future. `spawn_child` (lifecycle pool) does not wait: it schedules an expiration for `start_timeout` on the service thread and responds from `boot.on_resolve`, so a chain of actors spawning in their constructors needs no thread per level (`test_nested_initialization_spawning_is_not_limited_by_the_lifecycle_pool`).
 - `:starting` sources may issue broker requests and may be spawn parents (`Node#active?`); `:starting` targets accept routed messages, which queue until the actor loop starts. An actor that passes `context.handle` to a child during its own `initialize` and has that child call back synchronously deadlocks until a timeout, as documented for synchronous calls generally.
 - `ActorBroker#roots` returns handles of live top-level actors.
 
@@ -279,7 +305,7 @@ A `/code-review ultra` pass (2026-09-22, standard diff review; the launch note a
 
 A second `/code-review ultra` (whole repository, base tag `review-base` on an empty-tree commit, with `REVIEW.md` in the diff as the reviewers' brief) produced three findings, all fixed with tests:
 
-5. `run_service` ran expiries and tasks unguarded, and `wake_service` never replaced a dead thread, so one raising callback silently ended route timeouts and restart scheduling for the broker's lifetime. Each unit of work is now `guarded`; a `StandardError` is reported and the loop continues, and `wake_service` starts a replacement whenever the thread is not alive.
+5. `run_service` ran expirations and tasks unguarded, and `wake_service` never replaced a dead thread, so one raising callback silently ended route timeouts and restart scheduling for the broker's lifetime. Each unit of work is now `guarded`; a `StandardError` is reported and the loop continues, and `wake_service` starts a replacement whenever the thread is not alive.
 6. A non-`StandardError` (e.g. `NoMemoryError`) escaping a lifecycle job killed the worker, left it counted in `@lifecycle_workers`, and never answered the requesting actor. The worker now reports any exception, answers actor requests with an error, re-raises only non-`StandardError`s, and removes itself from the pool in `ensure` so the next request starts a replacement.
 7. `stop_child` compared `force == true` while the in-process path used truthiness; unified on truthiness.
 
@@ -287,7 +313,7 @@ These introduced the first observability hook: `ActorBroker.new(error_handler:)`
 
 Tagging note: a bare commit hash after `ultra` is read as a focus note, and a base with no shared history triggers a whole-repository cost confirmation that only an interactive terminal session can answer; the extension's command path cannot. `review-since-initial` (tag on `22a97a2`) is the fallback base that needs no confirmation. The note passed on the command line is never delivered to the cloud reviewers. Documented channels for review guidance are the repository's `CLAUDE.md` (project instructions) and `REVIEW.md` (review-only instructions), both read by the local `/code-review`; whether the cloud sandbox reads them is undocumented but likely, since its agents are Claude Code sessions in a clone of the repository. On 2026-09-23 the review brief moved from `docs/review-focus.md` to `REVIEW.md` and a `CLAUDE.md` was added; the next ultra run will show whether findings cite the brief's invariant numbers.
 
-A third `/code-review ultra` (2026-09-23, whole repository, after `REVIEW.md` and `CLAUDE.md` existed) returned four findings, all fixed with tests: `Future#run_callbacks` let an application `on_resolve` block that raised abort `Reference#actor_exited` before the broker's exit hook (per-callback rescue reporting to `Future.callback_error_handler`); `on_event` ran on the service thread, so a slow handler stalled expiries and timers (events now go through a dedicated ordered event thread, joined on stop); watching a terminal actor replayed the event to `on_event` (`notify_application: false` on the catch-up path); the write-with-timeout branch in `Transport.write_payload` was dead since boot became a `Reference` request (removed). None of the findings cited `REVIEW.md` invariant numbers, though all four fell inside the areas it names.
+A third `/code-review ultra` (2026-09-23, whole repository, after `REVIEW.md` and `CLAUDE.md` existed) returned four findings, all fixed with tests: `Future#run_callbacks` let an application `on_resolve` block that raised abort `Reference#actor_exited` before the broker's exit hook (per-callback rescue reporting to `Future.callback_error_handler`); `on_event` ran on the service thread, so a slow handler stalled expirations and timers (events now go through a dedicated ordered event thread, joined on stop); watching a terminal actor replayed the event to `on_event` (`notify_application: false` on the catch-up path); the write-with-timeout branch in `Transport.write_payload` was dead since boot became a `Reference` request (removed). None of the findings cited `REVIEW.md` invariant numbers, though all four fell inside the areas it names.
 
 Whether the whole-repository reviewers used `REVIEW.md` is unclear: none of the findings cite its invariants by number, though finding 5 is invariant 9 in substance.
 
@@ -297,12 +323,12 @@ Targeted concurrency read (2026-09-22, by the author, invariant by invariant aga
 - Invariant 1 (one response, one release per request): each `dispatch` path ends in exactly one `respond`/`respond_error`; `release_once` guards the slot; a source that stops discards its control outbox exactly once (array swap under lock) and the writer's `ensure` covers the in-flight write.
 - Invariants 3–5 (boot settlement, stale exits, stop vs relaunch): both orderings of "reader rejects the boot future" and "reaper runs `actor_exited`" converge (`boot_exit` recorded during boot; `actor_failed` after settle); `relaunch` installs only under `:restarting` and kills the new process otherwise; `stop_subtrees` snapshots the reference at marking time; a `:restarting` node in backoff is stopped through its dead reference and the delayed relaunch finds it terminal.
 - Invariant 9 (anything an actor sends): a non-hash frame raises `TypeError` in `read_replies` and is now a protocol violation; a request without an integer `request_id` gets no response (the misbehaving actor's `call` blocks until it is stopped); floods are bounded by the per-source response slots, which block only that actor's reader.
-- Three changes came out of the read: `Reference#actor_exited` ran the broker's exit callbacks after `@socket.close` inside a `rescue IOError`, so a close error would have silenced the exit (callbacks now run unconditionally); failure-path subtree stops ran on the service thread and could delay route expiries by the kill grace per child (`stop_later` puts them on the lifecycle pool); `broker.stop` from a broker thread (an `error_handler`) joined its own thread (`ThreadError`; now skipped). Tests: `test_broker_stop_from_its_own_error_handler_does_not_deadlock`, `test_child_cleanup_after_a_failure_does_not_delay_route_expiries`.
+- Three changes came out of the read: `Reference#actor_exited` ran the broker's exit callbacks after `@socket.close` inside a `rescue IOError`, so a close error would have silenced the exit (callbacks now run unconditionally); failure-path subtree stops ran on the service thread and could delay route expirations by the kill grace per child (`stop_later` puts them on the lifecycle pool); `broker.stop` from a broker thread (an `error_handler`) joined its own thread (`ThreadError`; now skipped). Tests: `test_broker_stop_from_its_own_error_handler_does_not_deadlock`, `test_child_cleanup_after_a_failure_does_not_delay_route_expirations`.
 - Remaining review debt: this read is the author's. If an independent pass is wanted, `REVIEW.md` is the brief.
 
 Public surface (2026-09-22): `Reference`, `Transport`, `BrokerClient`, and `Runner` joined `Launcher` as `private_constant`s, so the API is exactly `ActorBroker`, `ActorHandle`, `ActorContext`, `Future`, `ExitStatus`, the errors, and the `RocotoActor` module functions (`context`, `worker_process?`, `broker_client`). Tests that exercise internals directly reach them with `RocotoActor.const_get(:Name)` (`test/transport_test.rb`, `test/rocoto_actor_test.rb`, `test/soak/soak.rb`, and one support actor). `Runner.run` is invoked from inside the module namespace at the end of `runner.rb` because the constant is private. `test_internals_are_not_public` asserts the split using `Module#constants`, which omits private constants.
 
-Lint and CI (2026-09-22): RuboCop 1.91 with `.rubocop.yml` (target 3.2, new cops enabled, line length 120, `Metrics` disabled on purpose, rescued exceptions named `error`, three success-reporting commands allow-listed from `Naming/PredicateMethod`); `bundle exec rake` runs rubocop then the suite. The first `rubocop -A` pass silently broke every actor-exit path: the unsafe `Style/HashEachMethods` rewrote `discarded.each { |_payload, on_done| ... }` to `each_value` on what is an Array of pairs. Prefer `rubocop -a` (safe only) and run the suite after any auto-correct. `.github/workflows/ci.yml` runs lint and the suite on Ruby 3.2–3.4 on Ubuntu plus 3.4 on macOS, and a manual `workflow_dispatch` soak job taking `soak_seconds`. First CI run: Ruby 3.3, 3.4, and macOS 3.4 passed; Ruby 3.2 failed at `bundle install` because the lockfile (resolved on 3.4) had `parallel 2.2.0`, a RuboCop dependency whose 2.x line requires Ruby >= 3.3. `Gemfile` pins `parallel "~> 1.28"` (supports 2.7+; RuboCop accepts `>= 1.10`) until the Ruby floor is raised to 3.3, at which point the pin should be removed. General rule: the committed lockfile must resolve on the oldest supported Ruby, so relock with the floor version or keep dev dependencies pinned to versions that support it. A later macOS run exposed two test races: asserting a descendant's `:stopped` state after waiting on a *different* node, while retirement proceeds deepest-first (`stop_subtrees`) or on the lifecycle pool concurrently with a relaunch. Rule for tests: wait on the exact node whose state you assert; never infer one node's terminal state from another's.
+Lint and CI (2026-09-22): RuboCop 1.91 with `.rubocop.yml` (target 3.2, new cops enabled, line length 120, `Metrics` disabled on purpose, rescued exceptions named `error`, three success-reporting commands allow-listed from `Naming/PredicateMethod`); `bundle exec rake` runs rubocop then the suite. The first `rubocop -A` pass silently broke every actor-exit path: the unsafe `Style/HashEachMethods` rewrote `discarded.each { |_payload, on_done| ... }` to `each_value` on what is an Array of pairs. Prefer `rubocop -a` (safe only) and run the suite after any auto-correct. `.github/workflows/ci.yml` runs lint and the suite on Ruby 3.2–3.4 on Ubuntu plus 3.4 on macOS, and a manual `workflow_dispatch` soak job taking `soak_seconds`. First CI run: Ruby 3.3, 3.4, and macOS 3.4 passed; Ruby 3.2 failed at `bundle install` because the lockfile (resolved on 3.4) had `parallel 2.2.0`, a RuboCop dependency whose 2.x line requires Ruby >= 3.3. `Gemfile` pins `parallel "~> 1.28"` (supports 2.7+; RuboCop accepts `>= 1.10`) until the Ruby floor is raised to 3.3, at which point the pin should be removed. General rule: the committed lockfile must resolve on the oldest supported Ruby, so relock with the floor version or keep dev dependencies pinned to versions that support it. On 2026-09-26 the floor was raised to 3.3, the `parallel` pin removed, and 3.2 dropped from the CI matrix. A later macOS run exposed two test races: asserting a descendant's `:stopped` state after waiting on a *different* node, while retirement proceeds deepest-first (`stop_subtrees`) or on the lifecycle pool concurrently with a relaunch. Rule for tests: wait on the exact node whose state you assert; never infer one node's terminal state from another's.
 
 Linux fault matrix (2026-09-22): `test/validation/fault_matrix.rb` (with `support.rb` actors that misbehave on purpose and `app_child.rb`, a throwaway application) executes the cases from `docs/linux-validation.md` that the suite does not cover, each under a hard time limit, printing PASS/FAIL/NOTE per probe; results are recorded in that document. Writing and running it found:
 
@@ -318,6 +344,238 @@ Soak harness: `test/soak/soak.rb` (`SOAK_SECONDS=1800 bundle exec ruby -Ilib tes
 Soak results (2026-09-22, this container): a 10-minute run (~900k operations, ~250 injected failures) showed threads and file descriptors flat during the run and back to baseline after `broker.stop`, no surviving children, and only expected error classes. Findings: a single-sample zombie (the normal exit-to-`waitpid` window; the check now requires persistence), `Reference`/`Future` counts growing with terminal nodes (fixed by `retire`), and one `broker.stop` returning false while every process was gone a second later, which did not reproduce in later runs; `StopDiagnostics` in the harness will name the reference if it recurs. Long runs (2026-09-23, CI on ubuntu-latest): a 1800 s soak passed, and a 7200 s soak passed with ~19 million operations, ~4,500 injected failures (749 of each of the six kinds), live `Reference` count flat at 17, RSS 55 MB at the end (the same plateau seen at 10 minutes, so no slow growth), no zombies, `broker.stop => true in 0.096 s`, and no `Reference#stop` returning false in two hours, which retires the unreproduced `stop=false` observation from the first run. The CI step itself timed out because its `timeout-minutes` equalled the soak length; it is now 350 minutes, so `soak_seconds` must stay under about 20000.
 
 After `retire`, a 3-minute run passed every check: live `Reference` count flat at 15–17 and zero after `broker.stop`, `Future` count flat, `heap_live_slots` flat, and RSS climbing only during the first minute (24→36 MB) before plateauing at ~37 MB, so the earlier steady RSS growth was terminal-node retention plus heap warm-up rather than a leak. A multi-hour run before production is still worthwhile for the `broker.stop` false return that did not reproduce.
+
+## Simplification series (2026-09-24)
+
+With the feature set complete and the review findings converged, six
+behavior-preserving changes were made in order, each its own PR gated on lint,
+the full suite, the fault matrix, and a 30-minute CI soak before the next
+began. None changed the public API.
+
+1. **Dead weight.** Removed what no caller reached: `Launcher.spawn` (the
+   launch-and-wait helper left over from before boot became a `Reference`
+   request; the low-level tests moved to `test/support/launch_helper.rb`), the
+   unused `Protocol.success`/`failure`/`error_response` variants, and dead
+   branches in `runner.rb` and `broker.rb`.
+2. **`Reference#actor_id` replaces the reverse map.** The broker kept
+   `@node_ids_by_reference`, an identity hash from reference to node id, purely
+   to answer "which actor sent this?". The reference now carries its own
+   `actor_id`, set at registration, and `node_for(source)` checks that the node
+   still holds that reference. One map and its invalidation on every retire and
+   relaunch disappeared.
+3. **`SpawnOptions`.** `broker.spawn`, `context.spawn`, and the `broker_spawn`
+   request each validated options with their own copy of `SPAWN_OPTIONS` /
+   `POLICY_OPTIONS`. One class now parses and validates, so all three paths
+   raise the same `ArgumentError` messages, and the broker still parses again
+   at the trust boundary.
+4. **Timers and watchers onto `ActorNode`.** They were broker-level hashes
+   keyed by node id (`@timers`, `@watchers`) with `purge_timers`/`purge_watches`
+   called from `retire`, `actor_failed`, and `relaunch`. As node fields they are
+   released by `ActorNode#retire` itself, which deleted the purge methods and
+   the class of bug where one caller forgot to purge.
+5. **One boot flow.** `settle_boot` (first boot) and `settle_restart`
+   (relaunch) were near-duplicates that had already drifted. They became
+   `await_boot` (arm the deadline, settle exactly once on whichever thread
+   resolves the future) and `settle` (apply the outcome), with `first_boot?`
+   as the only branch between them.
+6. **`Reference` phase model.** Five booleans that had to be set in the right
+   combinations (`@stopped`, `@termination_started`, `@writer_stopped`,
+   `@process_exited`, `@group_exited`) became one forward-only phase: `open` → `draining` → `terminating` → `exited` → `gone`,
+   with `enter(phase)` doing the shared shutdown work once. `kill`,
+   `close_and_reap`, and `actor_exited` now differ only in whether they kill the
+   group and whether they wait for the reader to drain the watchdog's exit
+   report.
+
+## Process-limit preflight (2026-09-25)
+
+One actor costs about seven kernel tasks: the watchdog and worker processes
+(two threads each) plus the application-side reader, writer, and reaper. An
+application with three actors is about 26 tasks in all, the broker's own three
+threads included. `RLIMIT_NPROC` counts every process and thread of the uid on
+the whole host, and the fault matrix had already shown that reaching it can wedge the
+Ruby VM in a futex where only `KILL` removes it. The library cannot recover a
+wedged VM, so the design goal is to never be the process that hits the wall.
+
+`ProcessBudget` (`TASKS_PER_ACTOR = 7`) reads the soft limit with `getrlimit`
+and counts the uid's tasks by summing the `Threads:` field of every `/proc`
+entry, so nothing is forked to take the measurement. `check!(margin)` raises
+`ResourceLimitError` when one more actor plus the margin would not fit, and
+runs before every launch: `broker.spawn`, `context.spawn`, and every relaunch.
+`ActorBroker.new(process_margin:)` defaults to 32 and `nil` disables the check;
+`describe[:process_limit]` reports `{ limit:, in_use:, margin: }`. Root (real or
+effective uid 0) is exempt, because `RLIMIT_NPROC` does not apply to it and the
+`/proc` scan would count kernel threads. Where `/proc` is absent or the limit is
+unlimited, nothing is checked. A relaunch refused by the preflight counts
+against `max_restarts` like a crash, which is preferable to an unbounded wait
+for headroom in a run that lasts a minute or two.
+
+The check is an estimate: another process of the same uid can take the
+headroom between the `/proc` scan and the launch, and a cgroup `pids.max` is
+invisible to it. What happens then is the subject of the next section.
+
+## Fail-loud: built, and removed (2026-09-25 to 2026-09-26)
+
+**The motivation.** Every correctness finding in the three review rounds after
+the feature set stabilized was in the code that handled thread-creation failure
+in a degraded way: lazily started executor threads that reported "no thread"
+back to their callers, a tri-state `true`/`:stopped`/`false` protocol between
+the broker and its executors, `kill_subtrees` for when no lifecycle thread was
+available to stop children, and a `Reference` that polled `waitpid` when it had
+no reaper. The core paths (routing, lifecycle, restart, tell, timers, events,
+the reference phases) had zero findings across three independent reads. The
+conclusion looked sound: stop trying to run in a degraded state, and instead
+fail loudly.
+
+**What was built.** `ActorBroker#fail_broker(error)`: report once through
+`error_handler`, remember the `ResourceLimitError`, mark the broker stopped,
+retire every node as `:failed`, kill every process without waiting, and make
+every later call raise the remembered error. The degraded branches, the polling
+reaper, and `kill_subtrees` were deleted.
+
+**Why it did not converge.** About fifteen `/code-review high lib/` rounds
+followed, and each found real races — in `fail_broker` itself. A broker-wide
+state transition that can fire from any thread races every other path:
+`broker.stop` running concurrently, a boot settling, a relaunch in flight, the
+events a failure should or should not emit, futures in flight wanting the
+failure rather than a generic `ActorStoppedError`, confirming that the killed
+processes are gone. Each fix added more coordinated state — `@failure`,
+`@killed_references`, an `overtaken` flag, an `announce:` parameter, a two-phase
+kill — for the next round to find races in. Three other dynamics made it worse:
+the reviewer has no memory between rounds, so several judgment calls oscillated
+(whether a missing lifecycle worker should fail the broker or queue behind the
+existing one flipped four times); a memoryless reviewer asked to find something
+in a large concurrent file will always find something, so the stopping rule "a
+round that changes nothing" was unreachable; and four of the fix rounds shipped
+a slip of their own that the suite or the next round caught.
+
+**The root cause.** Round fourteen found what the previous thirteen had worked
+around: `fail_broker` was only reachable when the lifecycle pool was *empty*,
+because the `queue_locked` of the time returned success whenever a worker
+already existed. Two brokers at the same `RLIMIT_NPROC` edge behaved completely
+differently depending on whether an actor had happened to call `context.spawn`
+earlier.
+
+**The replacement.** The broker now creates its scheduler thread, its event
+thread, and its first lifecycle worker in `initialize`; `ActorBroker.new` raises
+`ResourceLimitError` if any of them cannot be created, which is the one moment a
+loud failure is clean. That first worker lives until `stop`, so internal work
+that owns actor state (`stop_later`, `relaunch`) can always be queued. A second
+worker that cannot be created merely leaves the pool smaller and the job waits
+for the existing one, reported once. **The broker therefore never needs a new
+thread of its own after construction, and the question `fail_broker` existed to
+answer does not arise.** A new actor's threads failing is that launch's problem:
+`Reference#initialize` raises `ResourceLimitError` through `Launcher.launch` to
+the spawner, or to `relaunch`, which counts it as a failure — exactly what a
+preflight refusal already did. `fail_broker`, `@failure`, and the degraded mode
+are all gone.
+
+The episode ended close to where it started in size: PR #18 is +384/-412 overall
+and +301/-295 under `lib/`, because what it added (the eager worker, the two new
+modules below) is roughly what the degraded-mode code it deleted occupied. The
+gain is conceptual — one fewer global state transition, and no code path that
+only exists for a condition the construction-time check now prevents.
+
+**What was kept from the episode.** Two extractions that the churn produced and
+that stand on their own: `Threads.start`, the single creation site for every
+thread the library owns, which turns `ThreadError` into `ResourceLimitError` at
+the creation site so a `ThreadError` from lock misuse elsewhere is never
+mistaken for exhaustion; and `ErrorReporting.report`/`guard`, one policy for
+reporting to `error_handler` from a broker thread, replacing four hand-rolled
+copies that had drifted on whether the handler itself was protected. Also kept
+are several genuine bugs found along the way that were independent of the
+deleted path: `live_postorder` raising on a stale child id left by a parent
+unregistered before its child; `Reference#stop` swallowing a stop-hook error
+into a silent `KILL`; a boot that succeeds while a stop is in flight; `boot_exit`
+not cleared per incarnation; and a `process_gone?` race in the test helper.
+
+**Review practice.** The loop was ended by scoping the review rather than
+repeating it: one round, restricted to the commit range, accepting only
+findings that name a concrete wrong output, crash, hang, leak, or lost message
+with the interleaving that produces it, explicitly excluding style, duplication,
+altitude, and missing tests, and listing the settled decisions that may not be
+reopened (no broker-wide failure mode; threads created in `initialize`; a
+missing second worker only shrinks the pool; broker threads never die;
+`broker.stop` emits no events; `Reference#stop`'s rescue list is deliberate; no
+retries or idempotency keys). That round returned no findings and independently
+re-verified the reorder. Use this form for a codebase that has already
+converged; the open-ended form is for code that has not been reviewed at all.
+
+## broker.rb reorder (2026-09-26)
+
+`broker.rb` had grown to about 1,000 lines in the order things were added.
+It was regrouped by concern, with `# ===` banners and a reading guide above the
+class that states the three broker threads, the two lock rules, what "Caller
+holds @mutex" means, and a map of the sections: the application API; requests
+from actors (`dispatch` as the index); construction; serving one actor request;
+request capacity and replies; actor-owned timers; watches and lifecycle events;
+launching an actor and settling its boot; exit, restart, and stopping; the node
+graph; small helpers. An actor's whole life is in two of those sections.
+
+The move was done by a script that re-emits whole method blocks, and verified
+three ways: the script asserts every block is placed exactly once and that each
+block's text is byte-identical before and after; the sorted line multisets of
+the two versions differ by zero removed lines, every difference being an added
+comment; and the suite, fault matrix, and a 10-minute soak passed. A later
+independent review re-extracted every method body at both commits and confirmed
+the same. One comment was moved rather than added: a line documenting `roots`
+had been attached to `describe`.
+
+A by-concern module split was considered and declined: the natural units
+(timers, watches and events, request capacity) are 40 to 100 lines each and
+would all need the broker's mutex and node graph passed around or reopened as
+mixins, which buys indirection rather than isolation. The banners do the work.
+
+## Multi-byte text: a defect the test suite could not see (2026-09-26)
+
+Prompted by a question about coverage: are there tests that send text like
+`"café naïve"` in every direction? There were none. A search for any non-ASCII
+byte across `lib/` and `test/` returned nothing, while the *invalid* UTF-8 case
+was covered thoroughly — `"\xFF".b` as an ask argument, as a result, in an
+exception message, in a tell, plus transport unit tests and a decoder fuzz
+probe. The well-covered case had masked the absence of the ordinary one.
+
+**The defect.** `Transport.write_payload` framed a message as
+`io.write([payload.bytesize].pack("N") << payload)`. `pack("N")` returns an
+ASCII-8BIT string and `JSON.generate` returns UTF-8 with raw multi-byte
+characters. Ruby refuses to concatenate two strings that both carry a byte
+above 0x7F, so the write raised `Encoding::CompatibilityError` whenever the
+payload held a multi-byte character *and* its length had a high byte. Sweeping
+400 payload sizes: 192 failed, 208 succeeded; the same lengths in ASCII always
+succeeded. An ask carrying `"café naïve"` serializes to 158 bytes, so it failed.
+
+**Why it hid.** Half of all lengths work, and short payloads always work
+because a small length header is pure ASCII. Any casual test with a short
+accented string passes. Nothing else in the suite used a non-ASCII byte.
+
+**The symptom was worse than the defect.** The failure happens on the writer
+thread, whose loop rescues only `IOError` and `SystemCallError`, so the thread
+died. The outbox then never drained: every later message to that actor timed
+out, not just the offending one. `error_handler` was never called, because this
+is not a broker thread, and the actor still reported `:running` and `alive?`,
+so no restart policy fired. One accented character could wedge a connection
+permanently and silently.
+
+**The fix** is to stop concatenating: `io.write([payload.bytesize].pack("N"),
+payload)`. Multi-argument `IO#write` emits them in sequence, which also removes
+a per-message string copy. The read side was already correct — `JSON.parse`
+returns properly tagged UTF-8 and values compare equal byte for byte.
+
+**Testing rule this produced.** A test for this class of bug must straddle the
+0x80 frame-length boundaries; a single short sample passes whether or not the
+bug is present. `test/transport_test.rb` sweeps 400 frame lengths, and
+`test/broker_unicode_test.rb` sends five lengths through each of nine
+directions: ask and reply, application tell, brokered ask between actors,
+brokered tell between actors, constructor arguments, names and paths, a raised
+message arriving as `RemoteError`, a scheduled message (scheduler thread), and
+a lifecycle event reason (event thread). Both were confirmed to fail against
+the old write before being accepted — the sweep reports 192 of 400 lengths, and
+seven of the nine end-to-end cases fail with timeouts and stopped actors.
+
+**The general lesson.** Coverage of the hostile input (invalid UTF-8) was
+mistaken for coverage of the input itself. When a suite tests only that bad
+values are rejected, check that some test also sends a good value of the same
+kind; here the encoding of every ordinary message was never exercised beyond
+ASCII.
 
 ## Immediate implementation plan
 

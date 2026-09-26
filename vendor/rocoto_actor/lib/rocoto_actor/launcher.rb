@@ -17,19 +17,9 @@ module RocotoActor
     # process. context: is delivered to the actor as RocotoActor.context.
     def launch(actor_class, *arguments, source: nil, mailbox_size: DEFAULT_MAILBOX_SIZE,
                mailbox_bytes: DEFAULT_MAILBOX_BYTES, context: nil)
-      actor_name = actor_class.is_a?(String) ? actor_class : actor_class.name
-      raise ArgumentError, "actor class must have a name" if actor_name.nil? || actor_name.empty?
-
-      source ||= Object.const_source_location(actor_name)&.first
-      raise ArgumentError, "cannot locate source for #{actor_name}; pass source:" unless source
-
-      # Reject bad options and unserializable arguments before paying for a process.
-      raise ArgumentError, "mailbox_size must be positive" unless mailbox_size.is_a?(Integer) && mailbox_size.positive?
-      unless mailbox_bytes.is_a?(Integer) && mailbox_bytes.positive?
-        raise ArgumentError,
-              "mailbox_bytes must be positive"
-      end
-
+      actor_name, source = resolve(actor_class, source)
+      # Reject unserializable arguments before paying for a process; the
+      # mailbox options were validated by SpawnOptions.
       Transport.dump(arguments: arguments, context: context)
 
       parent_socket, child_socket = UNIXSocket.pair
@@ -38,7 +28,7 @@ module RocotoActor
         "ROCOTO_ACTOR_FD" => CHILD_SOCKET_FD.to_s,
         "ROCOTO_ACTOR_PARENT_PID" => parent_pid.to_s,
         "ROCOTO_ACTOR_CLASS" => actor_name,
-        "ROCOTO_ACTOR_SOURCE" => File.expand_path(source)
+        "ROCOTO_ACTOR_SOURCE" => source
       }
       pid = Process.spawn(
         environment,
@@ -65,15 +55,16 @@ module RocotoActor
       raise
     end
 
-    # Launches and waits for the actor to become ready. Used by low-level tests;
-    # the broker uses launch so that the actor is registered while it boots.
-    def spawn(actor_class, *, start_timeout: START_TIMEOUT, **)
-      reference, boot = launch(actor_class, *, **)
-      boot.value(timeout: start_timeout)
-      reference
-    rescue StandardError => error
-      reference&.stop(force: true, timeout: 0)
-      raise startup_error(reference, error)
+    # The actor's class name and the absolute path of the file that defines it.
+    # A class name string requires source: unless the constant is defined here.
+    def resolve(actor_class, source)
+      actor_name = actor_class.is_a?(String) ? actor_class : actor_class.name
+      raise ArgumentError, "actor class must have a name" if actor_name.nil? || actor_name.empty?
+
+      source ||= Object.const_source_location(actor_name)&.first
+      raise ArgumentError, "cannot locate source for #{actor_name}; pass source:" unless source
+
+      [actor_name, File.expand_path(source)]
     end
 
     # Maps a boot future's failure to the error the spawner sees.
@@ -99,12 +90,30 @@ module RocotoActor
 
     def terminate_process_group(pid)
       signal_process_group(pid, "KILL")
-      Thread.new do
+      Threads.start("reaper-#{pid}") do
         Process.waitpid(pid)
       rescue Errno::ECHILD
         nil
       end
+    rescue ResourceLimitError
+      reap_without_thread(pid)
     end
+
+    # KILL is delivered asynchronously, so poll briefly rather than once; a
+    # process that cannot die within the window stays a zombie until the
+    # application exits, which is the best a caller with no threads can do.
+    def reap_without_thread(pid, patience: 1.0)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + patience
+      until Process.waitpid(pid, Process::WNOHANG)
+        return nil if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+        sleep 0.01
+      end
+      nil
+    rescue Errno::ECHILD
+      nil
+    end
+    private_class_method :reap_without_thread
 
     def signal_process_group(pid, signal)
       Process.kill(signal, -pid)

@@ -25,7 +25,7 @@ module RocotoActor
       return ask(message).value(timeout: timeout) if @broker
 
       remote!
-      @client.request(op: :broker_request, handle_id: @id, message: message, timeout: timeout)
+      @client.request(Protocol.request(:broker_request, handle_id: @id, message: message, timeout: timeout))
     end
 
     # Sends a message that expects no reply. Returns once the broker has placed
@@ -36,7 +36,7 @@ module RocotoActor
       return @broker.tell(@id, message) if @broker
 
       remote!
-      @client.request(op: :broker_tell, handle_id: @id, message: message)
+      @client.request(Protocol.request(:broker_tell, handle_id: @id, message: message))
       nil
     end
 
@@ -45,7 +45,7 @@ module RocotoActor
       return @broker.stop_actor(@id, timeout: timeout, force: force) if @broker
 
       remote!
-      @client.request(op: :broker_stop, handle_id: @id, timeout: timeout, force: force)
+      @client.request(Protocol.request(:broker_stop, handle_id: @id, timeout: timeout, force: force))
     end
 
     def alive?

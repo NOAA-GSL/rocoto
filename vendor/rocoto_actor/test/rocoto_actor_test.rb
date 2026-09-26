@@ -3,16 +3,17 @@
 require "minitest/autorun"
 require_relative "../lib/rocoto_actor"
 require_relative "support/example_actor"
+require_relative "support/launch_helper"
 require_relative "support/process_actor"
 require "tmpdir"
 
 # Exercises the internal process launcher and Reference directly; applications
 # go through RocotoActor::ActorBroker.
 class RocotoActorTest < Minitest::Test
-  LAUNCHER = RocotoActor.const_get(:Launcher)
+  include LaunchHelper
 
   def setup
-    @actor = LAUNCHER.spawn(ExampleActor, "reply")
+    @actor = spawn_actor(ExampleActor, "reply")
   end
 
   def teardown
@@ -36,7 +37,7 @@ class RocotoActorTest < Minitest::Test
 
   def test_actor_startup_errors_are_reported_to_the_parent
     error = assert_raises(RocotoActor::RemoteError) do
-      LAUNCHER.spawn(ExampleActor, :fail_boot)
+      spawn_actor(ExampleActor, :fail_boot)
     end
 
     assert_equal "ArgumentError", error.remote_class
@@ -45,7 +46,7 @@ class RocotoActorTest < Minitest::Test
 
   def test_spawn_rejects_an_unloadable_source
     error = assert_raises(RocotoActor::RemoteError) do
-      LAUNCHER.spawn(ExampleActor, source: File.join(Dir.tmpdir, "missing-rocoto-actor.rb"))
+      spawn_actor(ExampleActor, source: File.join(Dir.tmpdir, "missing-rocoto-actor.rb"))
     end
 
     assert_equal "LoadError", error.remote_class
@@ -53,7 +54,7 @@ class RocotoActorTest < Minitest::Test
 
   def test_spawn_rejects_unsupported_constructor_arguments
     assert_raises(RocotoActor::SerializationError) do
-      LAUNCHER.spawn(ExampleActor, Object.new)
+      spawn_actor(ExampleActor, Object.new)
     end
   end
 
@@ -123,7 +124,7 @@ class RocotoActorTest < Minitest::Test
   end
 
   def test_full_mailbox_rejects_instead_of_blocking
-    actor = LAUNCHER.spawn(ExampleActor, "reply", mailbox_size: 1)
+    actor = spawn_actor(ExampleActor, "reply", mailbox_size: 1)
     actor.ask(:hang)
     sleep 0.05
     actor.ask("x" * (8 * 1024 * 1024))
@@ -136,7 +137,7 @@ class RocotoActorTest < Minitest::Test
   end
 
   def test_mailbox_enforces_byte_limit
-    actor = LAUNCHER.spawn(ExampleActor, "reply", mailbox_bytes: 1_024)
+    actor = spawn_actor(ExampleActor, "reply", mailbox_bytes: 1_024)
 
     assert_raises(RocotoActor::MailboxFullError) { actor.ask("x" * 1_024) }
   ensure
@@ -154,7 +155,7 @@ class RocotoActorTest < Minitest::Test
     @actor.ask(:hang)
     first_stop = Thread.new { @actor.stop(timeout: 0.2) }
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 1
-    until @actor.instance_variable_get(:@stopped)
+    until @actor.instance_variable_get(:@phase) != :open
       raise "stop did not start" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
 
       Thread.pass
@@ -224,7 +225,7 @@ class RocotoActorTest < Minitest::Test
   def test_forceful_stop_terminates_actor_descendants
     Dir.mktmpdir do |directory|
       pid_file = File.join(directory, "child.pid")
-      actor = LAUNCHER.spawn(ProcessActor, pid_file)
+      actor = spawn_actor(ProcessActor, pid_file)
       actor.ask(seconds: 30)
       child_pid = wait_for_pid(pid_file)
 
@@ -240,7 +241,7 @@ class RocotoActorTest < Minitest::Test
   def test_worker_exit_rejects_future_and_terminates_inherited_socket_holder
     Dir.mktmpdir do |directory|
       pid_file = File.join(directory, "child.pid")
-      actor = LAUNCHER.spawn(ForkThenExitActor, pid_file)
+      actor = spawn_actor(ForkThenExitActor, pid_file)
       pending = actor.ask(:go)
       child_pid = wait_for_pid(pid_file)
 
@@ -258,7 +259,7 @@ class RocotoActorTest < Minitest::Test
       reader, writer = IO.pipe
       owner_pid = fork do
         reader.close
-        actor = LAUNCHER.spawn(BackgroundActor, pid_file)
+        actor = spawn_actor(BackgroundActor, pid_file)
         actor.ask(:go).value(timeout: 1)
         writer.puts(actor.pid)
         writer.close
@@ -282,18 +283,35 @@ class RocotoActorTest < Minitest::Test
     started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
     assert_raises(RocotoActor::Error) do
-      LAUNCHER.spawn(StubbornBootActor, start_timeout: 0.05)
+      spawn_actor(StubbornBootActor, start_timeout: 0.05)
     end
 
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
     assert_operator elapsed, :<, 1
   end
 
+  def test_exit_status_fields_from_the_wire_are_not_trusted
+    status = RocotoActor::ExitStatus.from_reply(exitstatus: nil, termsig: "x")
+    assert_equal "exited with status unknown", status.to_s
+    assert_equal "killed by signal 9 (KILL)", RocotoActor::ExitStatus.from_reply(exitstatus: nil, termsig: 9).to_s
+    assert_equal "killed by signal 999", RocotoActor::ExitStatus.from_reply(exitstatus: nil, termsig: 999).to_s
+  end
+
+  def test_failed_spawn_is_reaped_without_a_thread_to_reap_with
+    pid = Process.spawn(RbConfig.ruby, "-e", "sleep 30", pgroup: true)
+
+    Thread.stub(:new, ->(*) { raise ThreadError, "simulated" }) do
+      LaunchHelper::LAUNCHER.terminate_process_group(pid)
+    end
+
+    assert_raises(Errno::ECHILD) { Process.waitpid(pid, Process::WNOHANG) }
+  end
+
   def test_actor_exits_when_parent_dies_even_if_parent_socket_was_inherited
     reader, writer = IO.pipe
     owner_pid = fork do
       reader.close
-      actor = LAUNCHER.spawn(ExampleActor, "orphan")
+      actor = spawn_actor(ExampleActor, "orphan")
       socket_holder_pid = fork { sleep 10 }
       writer.puts("#{actor.pid} #{socket_holder_pid}")
       writer.close

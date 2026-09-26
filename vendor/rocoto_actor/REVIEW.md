@@ -26,13 +26,13 @@ can be violated are the most valuable output.
   a writer thread (`write_requests`), and a reaper thread (`start_reaper`,
   `actor_exited`). All share `@pending_mutex`.
 - Per broker (`lib/rocoto_actor/broker.rb`): a service thread (`run_service`:
-  route expiries and delayed tasks) and up to `max_lifecycle_workers` lifecycle
+  route expirations and delayed tasks) and up to `max_lifecycle_workers` lifecycle
   threads (`run_lifecycle_worker`: actor-initiated spawn/stop and relaunches).
   All share the broker `@mutex`.
 - Application threads call `spawn`, `ask`, `tell`, `stop`, `stop_actor`, and the
   query methods on `ActorBroker`.
 - Callbacks: `Future#on_resolve` blocks run on whichever thread resolves the
-  future (a reader thread, the service thread on expiry, or an application
+  future (a reader thread, the service thread on expiration, or an application
   thread on `value(timeout:)`). `Reference#on_exit` blocks run on the reaper
   thread. `Reference#send_broker_response(on_done:)` callbacks run on the
   writer thread, or on whichever thread discards the response.
@@ -49,12 +49,12 @@ violations, in particular through callbacks: `on_resolve`, `on_exit`, `on_done`,
 ## Invariants to check
 
 1. Every accepted broker request (`dispatch`) reaches exactly one caller-visible
-   outcome: one `send_broker_response`, and its `release_response` callback runs
-   exactly once, on every path including errors, expiry, source death, and
+  outcome: one `send_broker_response`, and its `release_response` callback runs
+  exactly once, on every path including errors, expiration, source death, and
    broker stop.
 2. `@routes` and `@responses_by_source` return to zero; no path leaks a slot.
 3. A node's boot future is settled exactly once, by exactly one of
-   `spawn` (synchronous path), `spawn_child` (`on_resolve`), or the expiry, and
+  `spawn` (synchronous path), `spawn_child` (`on_resolve`), or the expiration, and
    `settle_boot`/`settle_restart` are idempotent under `node.booting`.
 4. `actor_exited(node, reference)` ignores exits from a reference that is no
    longer the node's current one, and an exit during a boot is not lost
@@ -88,10 +88,10 @@ violations, in particular through callbacks: `on_resolve`, `on_exit`, `on_done`,
 - Source actor dies with routes pending: `discard_control_outbox` runs the
   `on_done` callbacks from the writer thread's `ensure` and from
   `actor_exited`; confirm each callback runs once.
-- `Future#value(timeout:)` expiring on an application thread concurrently with
+- `Future#value(timeout:)` reaching its expiration on an application thread concurrently with
   the reader fulfilling the same future.
 - The reaper's `@reader.join(1)` in `Reference#actor_exited` when the reader is
-  itself the thread that called `force_stop` → `start_reaper`.
+  itself the thread that called `kill`.
 
 ## Out of scope
 

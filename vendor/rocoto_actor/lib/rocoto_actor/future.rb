@@ -54,7 +54,7 @@ module RocotoActor
         @callbacks << block unless @resolved
         @resolved
       end
-      block.call(@result, @error) if resolved
+      invoke(block) if resolved
       self
     end
 
@@ -103,11 +103,13 @@ module RocotoActor
         @callbacks = []
         values
       end
-      callbacks.each do |callback|
-        callback.call(@result, @error)
-      rescue StandardError, ScriptError => error
-        Future.report_callback_error(error)
-      end
+      callbacks.each { |callback| invoke(callback) }
+    end
+
+    def invoke(callback)
+      callback.call(@result, @error)
+    rescue StandardError, ScriptError => error
+      Future.report_callback_error(error)
     end
 
     class << self

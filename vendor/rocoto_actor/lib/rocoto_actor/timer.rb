@@ -16,7 +16,7 @@ module RocotoActor
     def cancel
       raise Error, "a timer can only be cancelled by the actor that created it" unless @client
 
-      @client.request(op: :broker_cancel, timer_id: @id)
+      @client.request(Protocol.request(:broker_cancel, timer_id: @id))
     end
 
     def ==(other)

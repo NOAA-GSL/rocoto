@@ -4,6 +4,20 @@ require "minitest/autorun"
 require_relative "../lib/rocoto_actor"
 
 class FutureTest < Minitest::Test
+  def test_a_callback_registered_after_resolution_is_guarded_too
+    reported = []
+    original = RocotoActor::Future.callback_error_handler
+    RocotoActor::Future.callback_error_handler = ->(error) { reported << error.message }
+    future = RocotoActor::Future.new
+    future.fulfill(:done)
+
+    future.on_resolve { |_result, _error| raise "late callback bug" }
+
+    assert_equal ["late callback bug"], reported
+  ensure
+    RocotoActor::Future.callback_error_handler = original
+  end
+
   def test_timeout_wakes_other_waiters
     future = RocotoActor::Future.new
     waiter = Thread.new do

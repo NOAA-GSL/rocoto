@@ -3,49 +3,62 @@
 require "securerandom"
 
 module RocotoActor
+  # The only way to create an actor, and the owner of all cross-actor policy:
+  # the node graph (paths, parents, children, states, generations), brokered
+  # calls and tells, route limits and deadlines, the restart policy, watches
+  # and events, actor-owned timers, and the process-limit preflight.
+  #
+  # Threads. The application's own thread runs the public API. Three broker
+  # threads, all created by #initialize and alive until #stop, run the rest:
+  # the deadline scheduler (route and boot expirations, timer firing, restart
+  # backoff), the event dispatcher (on_event and watcher delivery), and a
+  # lifecycle pool (spawn and stop work, which blocks on processes). Each actor
+  # has a reader, a writer, and a reaper thread of its own in Reference, so a
+  # request from an actor is served on that actor's reader thread and must not
+  # block there.
+  #
+  # Locks. One mutex guards every instance variable here. Two rules keep it
+  # deadlock-free, and every method below obeys them:
+  #
+  #   1. Never hold @mutex while calling a Reference method that takes the
+  #      reference mutex (ask, tell, stop, kill, alive?). Collect what is
+  #      needed under the lock; act after releasing it.
+  #   2. Never run an application or actor callback under @mutex.
+  #
+  # "Caller holds @mutex" on a method means it must be called with the lock
+  # already held.
+  #
+  # Reading order. The sections below are marked with "# ===" banners:
+  #
+  #   The application API           what an application calls; every entry is short
+  #   Requests from actors          dispatch: the index of what an actor can ask for
+  #   Construction                  the broker's own threads, started by initialize
+  #   Serving one actor request     one handler per operation, none of which waits
+  #   Request capacity and replies  the bounds on requests in flight, and writing answers back
+  #   Actor-owned timers            schedule, cancel, fire
+  #   Watches and lifecycle events  who is told when an actor's state changes
+  #   Launching an actor            launch_node through settle: the boot path, first and relaunch
+  #   Exit, restart, and stopping   what happens when a process ends, by policy or by request
+  #   The node graph                lookups and derived state, under @mutex
+  #   Small helpers                 validation and thin wrappers over the executors
+  #
+  # An actor's whole life is in two of those: "Launching an actor" starts it,
+  # "Exit, restart, and stopping" ends it. docs/architecture.md has the process
+  # and component picture around them, and REVIEW.md the invariants to preserve.
   class ActorBroker
     DEFAULT_MAX_ROUTES = 1_000
     DEFAULT_MAX_ROUTES_PER_ACTOR = 100
     DEFAULT_ROUTE_TIMEOUT = 30
     DEFAULT_MAX_LIFECYCLE_WORKERS = 2
     DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS = 100
-    REQUEST_OPS = %i[broker_request broker_tell broker_spawn broker_stop broker_schedule broker_cancel
-                     broker_watch broker_unwatch].freeze
-    EVENTS = %i[failed restarting restarted stopped].freeze
     MAX_TIMERS_PER_ACTOR = 100
     MIN_TIMER_INTERVAL = 0.01
-    SPAWN_OPTIONS = ActorContext::SPAWN_OPTIONS
-    STATES = %i[starting running restarting stopping stopped failed].freeze
-    TERMINAL_STATES = %i[stopped failed].freeze
-    # States in which the actor's process may issue broker requests; a
-    # :restarting node is only reachable while its relaunch is booting.
-    ACTIVE_STATES = %i[starting running restarting].freeze
-    RESTART_POLICIES = %i[never on_failure].freeze
-    DEFAULT_MAX_RESTARTS = 3
-    DEFAULT_RESTART_WINDOW = 60
-    DEFAULT_RESTART_BACKOFF = 0.1
-    POLICY_OPTIONS = %i[restart max_restarts restart_window restart_backoff].freeze
+    DEFAULT_PROCESS_MARGIN = 32
     DEFAULT_ERROR_HANDLER = lambda do |error, context|
       warn "rocoto_actor: #{context}: #{error.class}: #{error.message}"
     end
 
-    TimerRecord = Struct.new(:id, :node_id, :generation, :message, :every)
-
-    # Logical lifecycle record for one brokered actor. Every actor process is a
-    # direct child of the application; parent/child structure exists only here.
-    # A node is registered while its actor boots (:starting) so the actor can
-    # spawn children from initialize; a failed boot unregisters it. spec holds
-    # what is needed to relaunch the actor; restarts records recent restart times.
-    Node = Struct.new(:id, :name, :path, :generation, :parent_id, :children, :state, :reference, :booting,
-                      :spec, :policy, :restarts, :failure, :exit, :boot_exit, :started_at) do
-      def terminal?
-        TERMINAL_STATES.include?(state)
-      end
-
-      def active?
-        ACTIVE_STATES.include?(state)
-      end
-    end
+    TimerRecord = Struct.new(:id, :message, :every)
 
     # max_routes bounds brokered requests awaiting a target actor across the broker.
     # max_routes_per_actor bounds the broker responses owed to one source actor that
@@ -55,10 +68,15 @@ module RocotoActor
     # with at most max_pending_lifecycle_requests waiting for one. error_handler
     # receives (error, context) for failures on the broker's own threads, which
     # are reported rather than allowed to kill the thread; it must not raise.
+    # Raises ResourceLimitError when the broker's own threads cannot be created.
     def initialize(max_routes: DEFAULT_MAX_ROUTES, max_routes_per_actor: DEFAULT_MAX_ROUTES_PER_ACTOR,
                    route_timeout: DEFAULT_ROUTE_TIMEOUT, max_lifecycle_workers: DEFAULT_MAX_LIFECYCLE_WORKERS,
                    max_pending_lifecycle_requests: DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS,
-                   error_handler: DEFAULT_ERROR_HANDLER, on_event: nil)
+                   error_handler: DEFAULT_ERROR_HANDLER, on_event: nil, process_margin: DEFAULT_PROCESS_MARGIN)
+      unless process_margin.nil? || (process_margin.is_a?(Integer) && process_margin >= 0)
+        raise ArgumentError, "process_margin must be a non-negative integer or nil"
+      end
+
       raise ArgumentError, "on_event must respond to call" unless on_event.nil? || on_event.respond_to?(:call)
 
       raise ArgumentError, "error_handler must respond to call" unless error_handler.respond_to?(:call)
@@ -78,94 +96,72 @@ module RocotoActor
       @max_pending_lifecycle_requests = max_pending_lifecycle_requests
       @error_handler = error_handler
       @on_event = on_event
-      @watchers = {} # watched node id => { watcher node id => true }
-      @events = Queue.new # delivered in order on one thread that never runs anything else
-      @event_thread = nil
+      @process_margin = process_margin
       @waiting = {} # node id => id of the node it is blocked on (a call or a child's boot)
-      @lifecycle_queue = [] # [source, request, release_response] or an internal callable
-      @lifecycle_workers = []
-      @idle_lifecycle_workers = 0
-      @lifecycle_condition = ConditionVariable.new
-      @node_ids_by_reference = {}.compare_by_identity
-      @timers = {} # id => TimerRecord; an actor's timers die with its incarnation
       @mutex = Mutex.new
       @capacity_condition = ConditionVariable.new
       @nodes = {}
       @routes = 0
       @responses_by_source = Hash.new(0).compare_by_identity
-      @expiries = {}.compare_by_identity
-      @tasks = []
-      @service_condition = ConditionVariable.new
-      @service = nil
       @stopped = false
+      # References a failed boot killed without waiting: pruned as their exits
+      # are observed; stop confirms any still alive.
+      @killed_references = {}.compare_by_identity
+      @scheduler = DeadlineScheduler.new(error_handler: @error_handler)
+      @lifecycle_executor = LifecycleExecutor.new(
+        max_workers: @max_lifecycle_workers,
+        max_pending_requests: @max_pending_lifecycle_requests,
+        error_handler: @error_handler,
+        request_error: lambda { |source, request, error, release|
+          respond_error(source, request[:request_id], Error.new("#{error.class}: #{error.message}"), release)
+        }
+      ) { |source, request, release| perform_lifecycle(source, request, release) }
+      @event_dispatcher = EventDispatcher.new(error_handler: @error_handler) do |*event|
+        deliver_event(*event)
+      end
+      start_executors
     end
+
+    # === The application API =================================================
 
     # parent: is a handle owned by this broker; the new actor becomes its logical
     # child and is stopped whenever the parent stops or fails. name: must be
-    # unique among the parent's live children and forms the actor's path.
-    # restart: :never (default) leaves a crashed actor :failed. :on_failure
-    # relaunches it with the same handle, path, and name and a new generation,
-    # after restart_backoff seconds doubling per consecutive restart, at most
-    # max_restarts times within restart_window seconds; beyond that it fails.
-    def spawn(actor_class, *arguments, name: nil, parent: nil, start_timeout: START_TIMEOUT,
-              restart: :never, max_restarts: DEFAULT_MAX_RESTARTS, restart_window: DEFAULT_RESTART_WINDOW,
-              restart_backoff: DEFAULT_RESTART_BACKOFF, **options)
-      raise ArgumentError, "start_timeout must be positive" unless valid_timeout?(start_timeout)
+    # unique among the parent's live children and forms the actor's path. The
+    # remaining options are those of SpawnOptions: start_timeout, source,
+    # mailbox_size, mailbox_bytes, and the restart policy (restart: :never by
+    # default, or :on_failure with max_restarts, restart_window, restart_backoff).
+    def spawn(actor_class, *arguments, name: nil, parent: nil, **options)
+      spawn_options = SpawnOptions.parse(options)
+      node, boot = launch_node(actor_class, arguments, parent_id: parent&.id, name: name, options: spawn_options)
+      settled = Queue.new
+      await_boot(node, boot, spawn_options.start_timeout) { |error| settled << error }
+      error = settled.pop
+      raise error if error
 
-      policy = validate_policy(restart: restart, max_restarts: max_restarts, restart_window: restart_window,
-                               restart_backoff: restart_backoff)
-      node, boot = launch_node(actor_class, arguments, parent_id: parent&.id, name: name, options: options,
-                                                       start_timeout: start_timeout, policy: policy)
-      begin
-        boot.value(timeout: start_timeout)
-      rescue StandardError => error
-        raise settle_boot(node, error)
-      end
-      settle_boot(node, nil)
       ActorHandle.new(node.id, broker: self)
     end
 
-    # Handles of top-level actors that have not stopped or failed.
-    # A plain-data snapshot of every actor the broker knows, for operators.
-    def describe
-      @mutex.synchronize do
-        {
-          stopped: @stopped,
-          routes_in_flight: @routes,
-          timers: @timers.size,
-          lifecycle_queue: @lifecycle_queue.size,
-          actors: @nodes.values.map { |node| describe_node(node) }
-        }
-      end
-    end
-
-    def roots
-      @mutex.synchronize do
-        @nodes.values.select { |node| node.parent_id.nil? && !node.terminal? }
-              .map { |node| ActorHandle.new(node.id, broker: self) }
-      end
-    end
-
     def stop(timeout: Reference::DEFAULT_STOP_TIMEOUT, force: false)
-      nodes, threads, abandoned = @mutex.synchronize do
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      nodes, threads = @mutex.synchronize do
         @stopped = true
         @capacity_condition.broadcast
-        @service_condition.broadcast
-        @lifecycle_condition.broadcast
-        queued = @lifecycle_queue
-        @lifecycle_queue = []
-        @events.close
-        [@nodes.values, [@service, @event_thread, *@lifecycle_workers].compact, queued]
+        event_thread = @event_dispatcher.stop
+        scheduler_thread = @scheduler.stop
+        [@nodes.values, [scheduler_thread, event_thread].compact]
       end
-      abandoned.each do |job|
-        next unless job.is_a?(Array)
-
-        source, request, release = job
-        respond_error(source, request[:request_id], ActorStoppedError.new("actor broker is stopped"), release)
-      end
+      abandoned = @lifecycle_executor.stop
+      abandoned.each { |job| respond_error(job.source, job.request[:request_id], stopped_error, job.release_response) }
       stopped = stop_subtrees(nodes, timeout: timeout, force: force)
+      # Processes failed boots killed without waiting, listed by now since the
+      # sweep is done: confirm them gone, with the grace a forced stop allows
+      # a KILL, once for the batch.
+      killed = @mutex.synchronize { @killed_references.keys.tap { @killed_references.clear } }
+      confirm_by = Reference.kill_deadline(deadline)
+      killed.each(&:kill) # idempotent; a settle may have listed one before killing it
+      confirmed = killed.select(&:alive?).map { |reference| reference.wait_for_exit(confirm_by) }.all?
       threads.each { |thread| thread.join unless thread == Thread.current } # stop may be called from error_handler
-      stopped
+      stopped && confirmed
     end
 
     def ask(id, message)
@@ -176,29 +172,34 @@ module RocotoActor
       @mutex.synchronize { checked_node(id).reference }.tell(message)
     end
 
-    # RemoteError for the most recent unhandled exception in a told message
-    # that ended one of this actor's incarnations, or nil.
-    def last_failure(id)
-      @mutex.synchronize do
-        node = fetch_node(id)
-        node.reference&.exit_error || node.failure
-      end
-    end
-
-    # ExitStatus of the most recent incarnation whose process ended on its own
-    # (crash, signal, or unhandled exception), or nil.
-    def last_exit(id)
-      @mutex.synchronize do
-        node = fetch_node(id)
-        node.reference&.exit_status || node.exit
-      end
-    end
-
     # Stops the actor's live descendants first, deepest first, then the actor.
     # The timeout is one deadline shared by the whole subtree.
     def stop_actor(id, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: false)
       node = @mutex.synchronize { fetch_node(id) }
       stop_subtrees([node], timeout: timeout, force: force)
+    end
+
+    # A plain-data snapshot of every actor the broker knows, for operators.
+    def describe
+      process_limit = @process_margin && ProcessBudget.snapshot(@process_margin) # scans /proc; keep it off the mutex
+      @mutex.synchronize do
+        {
+          stopped: @stopped,
+          routes_in_flight: @routes,
+          timers: @nodes.values.sum { |node| node.timers.size },
+          lifecycle_queue: @lifecycle_executor.pending_requests,
+          process_limit: process_limit,
+          actors: @nodes.values.map { |node| describe_node(node) }
+        }
+      end
+    end
+
+    # Handles of top-level actors that have not stopped or failed.
+    def roots
+      @mutex.synchronize do
+        @nodes.values.select { |node| node.parent_id.nil? && !node.terminal? }
+              .map { |node| ActorHandle.new(node.id, broker: self) }
+      end
     end
 
     def alive?(id)
@@ -229,11 +230,30 @@ module RocotoActor
     # Handles of the actor's children that have not stopped or failed.
     def children(id)
       @mutex.synchronize do
-        fetch_node(id).children.map { |child_id| @nodes[child_id] }
-                      .reject(&:terminal?)
-                      .map { |child| ActorHandle.new(child.id, broker: self) }
+        live_children(fetch_node(id)).map { |child| ActorHandle.new(child.id, broker: self) }
       end
     end
+
+    # RemoteError for the most recent unhandled exception in a told message
+    # that ended one of this actor's incarnations, or nil.
+    def last_failure(id)
+      @mutex.synchronize do
+        node = fetch_node(id)
+        node.reference&.exit_error || node.failure
+      end
+    end
+
+    # ExitStatus of the most recent incarnation whose process ended on its own
+    # (crash, signal, or unhandled exception), or nil.
+    def last_exit(id)
+      @mutex.synchronize do
+        node = fetch_node(id)
+        node.reference&.exit_status || node.exit
+      end
+    end
+
+    # === Requests from actors ================================================
+    # The worker side of the socket sends these; dispatch is the index.
 
     # Entry point for every broker request read from an actor's socket. Runs on
     # that actor's reader thread and must not block on other actors.
@@ -258,6 +278,67 @@ module RocotoActor
 
     private
 
+    # === Construction ========================================================
+
+    # Starts the scheduler and event threads and the first lifecycle worker.
+    # Without them the broker cannot run, and a lifecycle worker that exists
+    # from the start means internal work (stopping a failed actor's children,
+    # a relaunch) can always be queued; so a thread that cannot be created
+    # fails construction, and nothing later needs a thread the broker may not
+    # get.
+    def start_executors
+      @scheduler.start
+      @event_dispatcher.start
+      @lifecycle_executor.start
+    rescue ResourceLimitError
+      @scheduler.stop
+      @event_dispatcher.stop
+      @lifecycle_executor.stop
+      raise
+    end
+
+    # === Serving one actor request ===========================================
+    # Each handler answers its requester exactly once, and none of them waits
+    # on another actor: blocking work goes to the lifecycle pool.
+
+    # Never blocks on the target actor; the response is sent when the target
+    # future resolves or its route reaches its expiration.
+    def route(source, request, release_response)
+      request_id = request[:request_id]
+      timeout = request.fetch(:timeout, nil) || @route_timeout
+      unless valid_timeout?(timeout)
+        return respond_error(source, request_id, ArgumentError.new("invalid broker timeout"), release_response)
+      end
+
+      reference, sender, rejection = acquire_route(source, request[:handle_id])
+      return respond_error(source, request_id, rejection, release_response) if rejection
+
+      source_id = @mutex.synchronize { node_for(source)&.id }
+      release_route = release_once { release_route_slot(source_id) }
+      begin
+        future = reference.ask(request[:message], sender)
+      rescue StandardError => error
+        release_route.call
+        return respond_error(source, request_id, error, release_response)
+      end
+
+      if (error = failure_for(schedule_expiration(future, timeout)))
+        future.reject(error)
+      end
+      future.on_resolve do |result, error|
+        cancel_expiration(future)
+        release_route.call
+        if error
+          respond_error(source, request_id, error, release_response)
+        else
+          respond(source, request_id, result, release_response)
+        end
+      end
+    rescue StandardError => error
+      release_route&.call
+      respond_error(source, request_id, error, release_response)
+    end
+
     # Enqueues the message in the target's mailbox and acknowledges that, or
     # reports why it was not enqueued. Never waits for the target.
     def relay_tell(source, request, release_response)
@@ -276,367 +357,15 @@ module RocotoActor
       respond_error(source, request[:request_id], error, release_response)
     end
 
-    # Subscribes the requesting actor to the watched actor's lifecycle events.
-    # Watching an actor that is already terminal delivers that event at once.
-    def watch(source, request, release_response)
-      @mutex.synchronize do
-        watcher = source_node(source)
-        watched = @nodes[request[:handle_id]] or raise Error, "unknown actor handle"
-        if watched.terminal?
-          detail = { reason: watched.failure&.message || watched.exit&.to_s, generation: watched.generation }
-          queue_event(watched.id, watched.state, detail, [watcher.id], notify_application: false)
-        else
-          (@watchers[watched.id] ||= {})[watcher.id] = true
-        end
-      end
-      respond(source, request[:request_id], true, release_response)
-    rescue StandardError => error
-      respond_error(source, request[:request_id], error, release_response)
-    end
-
-    def unwatch(source, request, release_response)
-      removed = @mutex.synchronize do
-        watcher = @nodes[@node_ids_by_reference[source]]
-        watcher && !@watchers[request[:handle_id]]&.delete(watcher.id).nil?
-      end
-      respond(source, request[:request_id], removed, release_response)
-    rescue StandardError => error
-      respond_error(source, request[:request_id], error, release_response)
-    end
-
-    # Caller holds @mutex. Queues delivery of a lifecycle event to the
-    # application's on_event and to every watcher; a terminal event ends the
-    # watches. Delivery runs on the event thread, outside every lock.
-    def emit(node, event, reason)
-      watcher_ids = @watchers.fetch(node.id, {}).keys
-      @watchers.delete(node.id) if node.terminal?
-      queue_event(node.id, event, { reason: reason, generation: node.generation }, watcher_ids)
-    end
-
-    # Caller holds @mutex. Events go to one dedicated thread so that a slow
-    # on_event or a blocked watcher tell delays later events only, never route
-    # expiries, timers, or lifecycle work, and so that events stay ordered.
-    def queue_event(node_id, event, detail, watcher_ids, notify_application: true)
-      return if @stopped
-
-      @events << [node_id, event, detail, watcher_ids, notify_application]
-      return if @event_thread&.alive?
-
-      @event_thread = Thread.new do
-        Thread.current.report_on_exception = false
-        while (queued = @events.pop)
-          guarded("event delivery") { deliver_event(*queued) }
-        end
-      end
-      @event_thread.name = "rocoto-actor-broker-events" if @event_thread.respond_to?(:name=)
-    end
-
-    # Caller holds @mutex. Why the incarnation behind this reference ended, or
-    # nil if it has not reported anything.
-    def exit_reason(reference)
-      reference&.exit_error&.message || reference&.exit_status&.to_s
-    end
-
-    def deliver_event(node_id, event, detail, watcher_ids, notify_application)
-      handle = ActorHandle.new(node_id, broker: self)
-      guarded("on_event") { @on_event&.call(event, handle, detail) } if notify_application
-      watcher_ids.each do |watcher_id|
-        reference = @mutex.synchronize do
-          watcher = @nodes[watcher_id]
-          watcher&.active? ? watcher.reference : nil
-        end
-        next unless reference
-
-        begin
-          reference.tell({ op: :actor_event, event: event, actor: handle, reason: detail[:reason],
-                           generation: detail[:generation] }, nil)
-        rescue StandardError => error
-          report_error(error, "event to #{watcher_id}")
-        end
-      end
-    end
-
-    # Caller holds @mutex. Ends every watch held by this incarnation.
-    def purge_watches(node)
-      @watchers.each_value { |watchers| watchers.delete(node.id) }
-      @waiting.delete(node.id)
-    end
-
-    # Registers a self-addressed timer for the requesting actor and answers
-    # with its Timer. Runs inline on the reader thread; never waits.
-    def schedule_timer(source, request, release_response)
-      after = request[:after]
-      every = request[:every]
-      raise ArgumentError, "schedule needs after: or every:" if after.nil? && every.nil?
-      raise ArgumentError, "after must be a non-negative number" unless after.nil? || non_negative_number?(after)
-      unless every.nil? || (valid_timeout?(every) && every >= MIN_TIMER_INTERVAL)
-        raise ArgumentError, "every must be at least #{MIN_TIMER_INTERVAL} seconds"
-      end
-
-      timer = @mutex.synchronize do
-        node = source_node(source)
-        if @timers.count { |_id, record| record.node_id == node.id } >= MAX_TIMERS_PER_ACTOR
-          raise Error, "actor #{node.path} already has #{MAX_TIMERS_PER_ACTOR} timers"
-        end
-
-        record = TimerRecord.new(SecureRandom.hex(16), node.id, node.generation, request[:message], every)
-        @timers[record.id] = record
-        record
-      end
-      enqueue_task(delay: after || every) { fire_timer(timer.id) }
-      respond(source, request[:request_id], Timer.new(timer.id), release_response)
-    rescue StandardError => error
-      respond_error(source, request[:request_id], error, release_response)
-    end
-
-    def cancel_timer(source, request, release_response)
-      cancelled = @mutex.synchronize do
-        node = @nodes[@node_ids_by_reference[source]]
-        record = @timers[request[:timer_id]]
-        next false unless node && record && record.node_id == node.id
-
-        !@timers.delete(record.id).nil?
-      end
-      respond(source, request[:request_id], cancelled, release_response)
-    rescue StandardError => error
-      respond_error(source, request[:request_id], error, release_response)
-    end
-
-    # Runs on the service thread. Delivers the timer's message as a tell from
-    # the actor to itself, then re-arms a recurring timer. A timer whose actor
-    # incarnation is gone has already been purged; a tell that fails is
-    # reported and, for a recurring timer, tried again next interval.
-    def fire_timer(id)
-      record, reference, sender = @mutex.synchronize do
-        record = @timers[id]
-        next [nil, nil, nil] unless record
-
-        node = @nodes[record.node_id]
-        unless node && node.generation == record.generation && node.active?
-          @timers.delete(id)
-          next [nil, nil, nil]
-        end
-        @timers.delete(id) unless record.every
-        [record, node.reference, ActorHandle.new(node.id, broker: self)]
-      end
-      return unless record
-
-      begin
-        reference.tell(record.message, sender)
-      rescue StandardError => error
-        report_error(error, "scheduled tell to #{sender.id}")
-      end
-      enqueue_task(delay: record.every) { fire_timer(id) } if record.every
-    end
-
-    # Caller holds @mutex. Drops every timer of the node's current incarnation.
-    def purge_timers(node)
-      @timers.delete_if { |_id, record| record.node_id == node.id }
-    end
-
-    def non_negative_number?(value)
-      value.is_a?(Numeric) && value >= 0 && value.to_f.finite?
-    end
-
-    # Caller holds @mutex. The handle of the actor behind a source reference.
-    def sender_handle(source)
-      id = @node_ids_by_reference[source]
-      id && ActorHandle.new(id, broker: self)
-    end
-
-    # Never blocks on the target actor; the response is sent when the target
-    # future resolves or its route expires.
-    def route(source, request, release_response)
-      request_id = request[:request_id]
-      timeout = request.fetch(:timeout, nil) || @route_timeout
-      unless valid_timeout?(timeout)
-        return respond_error(source, request_id, ArgumentError.new("invalid broker timeout"), release_response)
-      end
-
-      reference, sender, rejection = acquire_route(source, request[:handle_id])
-      return respond_error(source, request_id, rejection, release_response) if rejection
-
-      source_id = @mutex.synchronize { @node_ids_by_reference[source] }
-      release_route = release_once { release_route_slot(source_id) }
-      begin
-        future = reference.ask(request[:message], sender)
-      rescue StandardError => error
-        release_route.call
-        return respond_error(source, request_id, error, release_response)
-      end
-
-      schedule_expiry(future, timeout)
-      future.on_resolve do |result, error|
-        cancel_expiry(future)
-        release_route.call
-        if error
-          respond_error(source, request_id, error, release_response)
-        else
-          respond(source, request_id, result, release_response)
-        end
-      end
-    rescue StandardError => error
-      release_route&.call
-      respond_error(source, request_id, error, release_response)
-    end
-
-    def validate_policy(restart:, max_restarts:, restart_window:, restart_backoff:)
-      unless RESTART_POLICIES.include?(restart)
-        raise ArgumentError,
-              "restart must be one of #{RESTART_POLICIES.join(', ')}"
-      end
-      unless max_restarts.is_a?(Integer) && max_restarts.positive?
-        raise ArgumentError,
-              "max_restarts must be a positive integer"
-      end
-      raise ArgumentError, "restart_window must be positive" unless valid_timeout?(restart_window)
-      unless restart_backoff.is_a?(Numeric) && restart_backoff >= 0 && restart_backoff.to_f.finite?
-        raise ArgumentError, "restart_backoff must be a non-negative number"
-      end
-
-      { restart: restart, max_restarts: max_restarts, restart_window: restart_window, restart_backoff: restart_backoff }
-    end
-
-    # Starts the process and registers it as :starting. Returns [node, boot];
-    # the caller must settle the boot future exactly once.
-    def launch_node(actor_class, arguments, parent_id:, name:, options:, start_timeout:, policy:)
-      name = validate_name(name)
-      @mutex.synchronize { check_placement(parent_id, name) }
-
-      id = SecureRandom.hex(16)
-      reference, boot = Launcher.launch(actor_class, *arguments, context: { actor_id: id }, **options)
-      spec = { actor_class: actor_class, arguments: arguments, options: options, start_timeout: start_timeout }
-      node = register(id, reference, parent_id, name, spec, policy)
-      reference.attach_broker(self)
-      reference.on_exit { actor_exited(node, reference) }
-      [node, boot]
-    rescue Exception # rubocop:disable Lint/RescueException
-      reference&.stop(force: true, timeout: 0)
-      unregister(node) if node
-      raise
-    end
-
-    # Moves a booted node to :running, or on failure kills the process,
-    # unregisters the node, and stops any children it spawned while booting.
-    # Returns the error to raise or send.
-    def settle_boot(node, error)
-      children, exited, reference = @mutex.synchronize do
-        next [[], false, nil] unless node.booting
-
-        node.booting = false
-        if error
-          [node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?), false, node.reference]
-        else
-          if node.state == :starting
-            node.state = :running
-            node.started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          end
-          [[], node.boot_exit.equal?(node.reference), nil]
-        end
-      end
-      # The process died after replying ready but before we settled: the actor
-      # is registered and running from the caller's view, so treat it as a crash.
-      actor_failed(node) if exited
-      return nil unless error
-
-      reference&.stop(force: true, timeout: 0)
-      unregister(node)
-      stop_later(children)
-      Launcher.startup_error(reference, error)
-    end
-
-    # Removes a node that never finished booting; its id is known only to the
-    # dead process, so no handle can refer to it.
-    def unregister(node)
-      @mutex.synchronize do
-        retire(node, :failed)
-        @nodes.delete(node.id)
-        @nodes[node.parent_id]&.children&.delete(node.id)
-      end
-    end
-
-    # Spawn and stop requests block for up to their timeouts, so they run on a
-    # bounded pool rather than on the requesting actor's reader thread.
-    # Internal jobs are bounded by the number of nodes, not by the request queue.
-    def enqueue_lifecycle_job(&block)
-      @mutex.synchronize do
-        next if @stopped
-
-        @lifecycle_queue << block
-        start_lifecycle_worker_if_needed
-        @lifecycle_condition.signal
-      end
-    end
-
-    # Caller holds @mutex.
-    def start_lifecycle_worker_if_needed
-      return unless @idle_lifecycle_workers.zero? && @lifecycle_workers.size < @max_lifecycle_workers
-
-      @lifecycle_workers << start_lifecycle_worker
-    end
-
+    # Spawn and stop requests block for up to their timeouts, so they run on
+    # the bounded pool rather than on the requesting actor's reader thread.
     def enqueue_lifecycle(source, request, release_response)
-      rejection = @mutex.synchronize do
-        next ActorStoppedError.new("actor broker is stopped") if @stopped
-        if @lifecycle_queue.count { |job| job.is_a?(Array) } >= @max_pending_lifecycle_requests
-          next BrokerBusyError.new("actor broker has #{@max_pending_lifecycle_requests} lifecycle requests waiting")
-        end
-
-        @lifecycle_queue << [source, request, release_response]
-        start_lifecycle_worker_if_needed
-        @lifecycle_condition.signal
-        nil
+      result = @mutex.synchronize do
+        @stopped ? :stopped : @lifecycle_executor.enqueue_request(source, request, release_response)
       end
-      respond_error(source, request[:request_id], rejection, release_response) if rejection
-    end
+      return if result == true
 
-    # Broker threads report failures through error_handler, so Ruby's own
-    # thread-death trace would only duplicate that on stderr.
-    def start_lifecycle_worker
-      worker = Thread.new do
-        Thread.current.report_on_exception = false
-        run_lifecycle_worker
-      end
-      worker.name = "rocoto-actor-broker-lifecycle" if worker.respond_to?(:name=)
-      worker
-    end
-
-    # A job that raises anything is reported and, for an actor request, answered
-    # with an error; the worker keeps running. Should the thread die anyway, it
-    # frees its slot so the next request starts a replacement.
-    def run_lifecycle_worker
-      loop do
-        job = @mutex.synchronize do
-          @idle_lifecycle_workers += 1
-          @lifecycle_condition.wait(@mutex) while @lifecycle_queue.empty? && !@stopped
-          @idle_lifecycle_workers -= 1
-          @stopped ? nil : @lifecycle_queue.shift
-        end
-        return unless job
-
-        begin
-          if job.is_a?(Array)
-            perform_lifecycle(*job)
-          else
-            job.call
-          end
-        rescue Exception => error # rubocop:disable Lint/RescueException
-          report_error(error, "lifecycle job")
-          if job.is_a?(Array)
-            source, request, release_response = job
-            respond_error(source, request[:request_id], Error.new("#{error.class}: #{error.message}"), release_response)
-          end
-          raise unless error.is_a?(StandardError)
-        end
-      end
-    ensure
-      @mutex.synchronize { @lifecycle_workers.delete(Thread.current) }
-    end
-
-    def report_error(error, context)
-      @error_handler.call(error, context)
-    rescue Exception # rubocop:disable Lint/RescueException
-      nil
+      respond_error(source, request[:request_id], failure_for(result) || result, release_response)
     end
 
     def perform_lifecycle(source, request, release_response)
@@ -662,31 +391,14 @@ module RocotoActor
       raise ArgumentError, "arguments must be an array" unless arguments.is_a?(Array)
       raise ArgumentError, "options must be a hash" unless options.is_a?(Hash)
 
-      unknown = options.keys - SPAWN_OPTIONS
-      raise ArgumentError, "unsupported spawn options: #{unknown.join(', ')}" unless unknown.empty?
+      # The worker parsed these too; the broker is the trust boundary and parses again.
+      spawn_options = SpawnOptions.parse(options.merge(source: path))
 
-      options = options.dup
-      start_timeout = options.delete(:start_timeout) || START_TIMEOUT
-      raise ArgumentError, "start_timeout must be positive" unless valid_timeout?(start_timeout)
-
-      policy = validate_policy(
-        restart: options.delete(:restart) || :never,
-        max_restarts: options.delete(:max_restarts) || DEFAULT_MAX_RESTARTS,
-        restart_window: options.delete(:restart_window) || DEFAULT_RESTART_WINDOW,
-        restart_backoff: options.key?(:restart_backoff) ? options.delete(:restart_backoff) : DEFAULT_RESTART_BACKOFF
-      )
-      raise ArgumentError, "spawn options must be numeric" unless options.values.all?(Numeric)
-
-      options[:source] = path
-
-      node, boot = launch_node(actor_class, arguments, parent_id: parent.id, name: request[:name], options: options,
-                                                       start_timeout: start_timeout, policy: policy)
+      node, boot = launch_node(actor_class, arguments, parent_id: parent.id, name: request[:name],
+                                                       options: spawn_options)
       @mutex.synchronize { @waiting[parent.id] = node.id } # the parent blocks in context.spawn until the boot settles
-      schedule_expiry(boot, start_timeout)
-      boot.on_resolve do |_result, error|
-        cancel_expiry(boot)
+      await_boot(node, boot, spawn_options.start_timeout) do |error|
         @mutex.synchronize { @waiting.delete(parent.id) if @waiting[parent.id] == node.id }
-        error = settle_boot(node, error)
         if error
           respond_error(source, request[:request_id], error, release_response)
         else
@@ -710,299 +422,21 @@ module RocotoActor
       stop_subtrees([node], timeout: timeout, force: request[:force] ? true : false)
     end
 
-    # Caller holds @mutex.
-    def source_node(source)
-      node = @nodes[@node_ids_by_reference[source]] or raise Error, "unknown source actor"
-      raise ActorStoppedError, "actor #{node.path} is #{node.state}" unless node.active?
-
-      node
+    # Queues internal blocking work (stops, relaunches) on the lifecycle pool;
+    # such jobs are bounded by the number of nodes, not by the request queue.
+    # Nothing is queued once the broker is stopping: its sweep owns every node
+    # from then on. Runs on reaper and scheduler threads, so it never raises.
+    def enqueue_lifecycle_job(&block)
+      @mutex.synchronize { @lifecycle_executor.enqueue_job(&block) unless @stopped }
+      nil
     end
 
-    # Caller holds @mutex.
-    def descendant?(node, ancestor_id)
-      while (parent_id = node.parent_id)
-        return true if parent_id == ancestor_id
-
-        node = @nodes[parent_id] or return false
-      end
-      false
-    end
-
-    def valid_timeout?(timeout)
-      timeout.is_a?(Numeric) && timeout.positive? && timeout.to_f.finite?
-    end
-
-    def validate_name(name)
-      return nil if name.nil?
-
-      name = name.to_s
-      raise ArgumentError, "actor name must not be empty" if name.empty?
-      raise ArgumentError, "actor name must not contain '/'" if name.include?("/")
-
-      name
-    end
-
-    # Caller holds @mutex. Returns the parent node, or nil for a root.
-    def check_placement(parent_id, name)
-      raise ActorStoppedError, "actor broker is stopped" if @stopped
-
-      parent = nil
-      if parent_id
-        parent = @nodes[parent_id] or raise Error, "unknown parent actor handle"
-        raise ActorStoppedError, "parent actor #{parent.path} is #{parent.state}" unless parent.active?
-      end
-      siblings = parent ? parent.children : @nodes.values.select { |node| node.parent_id.nil? }.map(&:id)
-      taken = name && siblings.any? { |id| (sibling = @nodes[id]) && !sibling.terminal? && sibling.name == name }
-      raise ArgumentError, "actor name #{name.inspect} is already in use" if taken
-
-      parent
-    end
-
-    def register(id, reference, parent_id, name, spec, policy)
-      @mutex.synchronize do
-        parent = check_placement(parent_id, name)
-        name ||= id
-        path = parent ? "#{parent.path}/#{name}" : name
-        node = Node.new(id, name, path, 1, parent_id, [], :starting, reference, true, spec, policy, 0)
-        @nodes[id] = node
-        @node_ids_by_reference[reference] = id
-        parent&.children&.push(id)
-        node
-      end
-    end
-
-    # Caller holds @mutex.
-    def fetch_node(id)
-      @nodes[id] or raise Error, "unknown actor handle"
-    end
-
-    # Caller holds @mutex. Moves a node to a terminal state and releases what
-    # only a live actor needs: the reference (threads, socket) and the relaunch
-    # spec. The node itself stays so its handle keeps answering with its state.
-    def retire(node, state)
-      node.state = state
-      purge_timers(node)
-      purge_watches(node)
-      reason = exit_reason(node.reference)
-      if (reference = node.reference)
-        node.failure = reference.exit_error || node.failure
-        node.exit = reference.exit_status || node.exit
-        @node_ids_by_reference.delete(reference)
-        node.reference = nil
-        node.spec = nil
-        node.restarts = 0
-      end
-      emit(node, state, reason)
-    end
-
-    # Caller holds @mutex.
-    def describe_node(node)
-      {
-        id: node.id, path: node.path, name: node.name, state: node.state, generation: node.generation,
-        parent_id: node.parent_id, children: node.children.dup, pid: node.reference&.pid,
-        restarts: node.restarts, waiting_on: @waiting[node.id], watchers: @watchers.fetch(node.id, {}).keys,
-        timers: @timers.count { |_id, record| record.node_id == node.id },
-        last_exit: (node.reference&.exit_status || node.exit)&.to_s,
-        last_failure: (node.reference&.exit_error || node.failure)&.message
-      }
-    end
-
-    # Caller holds @mutex. Returns the node only when it accepts messages.
-    def checked_node(id)
-      node = @nodes[id]
-      error = node_error(node)
-      raise error if error
-
-      node
-    end
-
-    def node_error(node)
-      return Error.new("unknown actor handle") unless node
-
-      case node.state
-      when :starting, :running then nil
-      when :restarting then ActorRestartingError.new("actor #{node.path} is restarting")
-      when :failed then ActorFailedError.new("actor #{node.path} failed")
-      else ActorStoppedError.new("actor #{node.path} is #{node.state}")
-      end
-    end
-
-    # Caller holds @mutex. Live descendants first, deepest first, then the node.
-    def live_postorder(node)
-      node.children.flat_map { |child_id| live_postorder(@nodes[child_id]) } + (node.terminal? ? [] : [node])
-    end
-
-    def stop_subtrees(roots, timeout:, force:)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      nodes = @mutex.synchronize do
-        roots.flat_map { |root| live_postorder(root) }.uniq.map do |node|
-          node.state = :stopping
-          [node, node.reference]
-        end
-      end
-      nodes.map do |node, reference|
-        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        stopped = reference.stop(timeout: [remaining, 0].max, force: force || remaining <= 0)
-        @mutex.synchronize { retire(node, :stopped) if node.state == :stopping }
-        stopped
-      end.all?
-    end
-
-    # Called from the actor's reaper thread once its process has exited. Exits
-    # during a boot are settled by the boot future's owner instead.
-    def actor_exited(node, reference)
-      @mutex.synchronize do
-        return if node.terminal? || !node.reference.equal?(reference)
-
-        if node.booting
-          node.boot_exit = reference
-          return
-        end
-        if node.state == :stopping
-          retire(node, :stopped)
-          return
-        end
-      end
-      actor_failed(node)
-    end
-
-    # Applies the restart policy to a running or restarting actor whose process
-    # is gone: schedules a relaunch, or marks it :failed. Either way its live
-    # descendants are stopped; a restarted actor recreates them in initialize.
-    def actor_failed(node)
-      delay, children = @mutex.synchronize do
-        next [nil, []] if node.terminal? || node.state == :stopping
-
-        # Mark the whole live subtree now so it rejects messages before the
-        # service thread gets to it; stop_subtrees re-derives the order itself.
-        live_postorder(node).each { |descendant| descendant.state = :stopping unless descendant.equal?(node) }
-        live = node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?)
-        delay = restart_delay(node)
-        purge_timers(node)
-        purge_watches(node)
-        if delay
-          node.state = :restarting
-          emit(node, :restarting, exit_reason(node.reference))
-        else
-          retire(node, :failed)
-        end
-        [delay, live]
-      end
-      stop_later(children)
-      enqueue_task(delay: delay) { enqueue_lifecycle_job { relaunch(node) } } if delay
-    end
-
-    # Force-stops nodes on the lifecycle pool: stopping waits on processes, and
-    # the service thread must stay free to run route expiries on time.
-    def stop_later(nodes)
-      return if nodes.empty?
-
-      enqueue_lifecycle_job { stop_subtrees(nodes, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true) }
-    end
-
-    # Caller holds @mutex. Records a restart attempt and returns its backoff
-    # delay, or nil when the policy forbids restarting now. The count is of
-    # consecutive failures and resets only after the actor has run for
-    # restart_window seconds, so backoff delays (time not running) can never
-    # prune failures out of the window and defeat max_restarts.
-    def restart_delay(node)
-      return nil if @stopped || node.policy[:restart] == :never
-
-      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      node.restarts = 0 if node.started_at && now - node.started_at > node.policy[:restart_window]
-      node.started_at = nil
-      return nil if node.restarts >= node.policy[:max_restarts]
-
-      node.restarts += 1
-      node.policy[:restart_backoff] * (2**(node.restarts - 1))
-    end
-
-    # Runs on a lifecycle thread. Replaces the node's dead reference with a new
-    # process under the same id, path, and name, and bumps the generation.
-    def relaunch(node)
-      spec = @mutex.synchronize { node.state == :restarting ? node.spec : nil }
-      return unless spec
-
-      reference, boot = Launcher.launch(spec[:actor_class], *spec[:arguments], context: { actor_id: node.id },
-                                                                               **spec[:options])
-      installed = @mutex.synchronize do
-        next false unless node.state == :restarting
-
-        @node_ids_by_reference.delete(node.reference)
-        node.failure = node.reference.exit_error || node.failure
-        node.exit = node.reference.exit_status || node.exit
-        purge_watches(node)
-        node.reference = reference
-        @node_ids_by_reference[reference] = node.id
-        node.generation += 1
-        node.booting = true
-        true
-      end
-      unless installed
-        reference.stop(force: true, timeout: 0)
-        return
-      end
-
-      reference.attach_broker(self)
-      reference.on_exit { actor_exited(node, reference) }
-      schedule_expiry(boot, spec[:start_timeout])
-      boot.on_resolve do |_result, error|
-        cancel_expiry(boot)
-        settle_restart(node, error)
-      end
-    rescue StandardError
-      actor_failed(node)
-    end
-
-    # A failed relaunch counts as another failure under the same policy.
-    def settle_restart(node, error)
-      kill, exited, reference = @mutex.synchronize do
-        next [false, false, nil] unless node.booting
-
-        node.booting = false
-        if node.state == :restarting && error.nil?
-          node.state = :running
-          node.started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          emit(node, :restarted, nil)
-        end
-        [!error.nil?, error.nil? && node.boot_exit.equal?(node.reference), node.reference]
-      end
-      return actor_failed(node) if exited
-      return unless kill
-
-      reference&.stop(force: true, timeout: 0)
-      actor_failed(node)
-    end
-
-    def acquire_response_slot(source)
-      @mutex.synchronize do
-        while @responses_by_source[source] >= @max_routes_per_actor
-          return false if @stopped
-
-          @capacity_condition.wait(@mutex)
-        end
-        return false if @stopped
-
-        @responses_by_source[source] += 1
-        true
-      end
-    end
-
-    def release_response_slot(source)
-      @mutex.synchronize do
-        remaining = @responses_by_source[source] - 1
-        if remaining.positive?
-          @responses_by_source[source] = remaining
-        else
-          @responses_by_source.delete(source)
-        end
-        @capacity_condition.broadcast
-      end
-    end
+    # === Request capacity and replies ========================================
+    # What bounds the requests in flight and what writes the answers back.
 
     def acquire_route(source, handle_id)
       @mutex.synchronize do
-        next [nil, nil, ActorStoppedError.new("actor broker is stopped")] if @stopped
+        next [nil, nil, stopped_error] if @stopped
 
         node = @nodes[handle_id]
         error = node_error(node)
@@ -1011,7 +445,7 @@ module RocotoActor
           next [nil, nil, BrokerBusyError.new("actor broker has #{@max_routes} routes in flight")]
         end
 
-        source_id = @node_ids_by_reference[source]
+        source_id = node_for(source)&.id
         cycle = source_id && wait_cycle(source_id, node.id)
         next [nil, nil, DeadlockError.new("call would deadlock: #{cycle.join(' -> ')}")] if cycle
 
@@ -1043,6 +477,32 @@ module RocotoActor
       end
     end
 
+    def acquire_response_slot(source)
+      @mutex.synchronize do
+        while @responses_by_source[source] >= @max_routes_per_actor
+          return false if @stopped
+
+          @capacity_condition.wait(@mutex)
+        end
+        return false if @stopped
+
+        @responses_by_source[source] += 1
+        true
+      end
+    end
+
+    def release_response_slot(source)
+      @mutex.synchronize do
+        remaining = @responses_by_source[source] - 1
+        if remaining.positive?
+          @responses_by_source[source] = remaining
+        else
+          @responses_by_source.delete(source)
+        end
+        @capacity_condition.broadcast
+      end
+    end
+
     def release_once(&block)
       released = false
       mutex = Mutex.new
@@ -1063,98 +523,555 @@ module RocotoActor
     end
 
     def respond_error(source, request_id, error, on_done)
-      if error.is_a?(RemoteError)
-        source.send_broker_response(
-          request_id,
-          error: error,
-          error_class: error.remote_class,
-          message: error.remote_message,
-          backtrace: error.remote_backtrace,
-          on_done: on_done
-        )
-      else
-        source.send_broker_response(request_id, error: error, on_done: on_done)
-      end
+      source.send_broker_response(request_id, error: error, on_done: on_done)
     rescue StandardError
       on_done.call
     end
 
-    def schedule_expiry(future, timeout)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    # === Actor-owned timers ==================================================
+
+    # Registers a self-addressed timer for the requesting actor and answers
+    # with its Timer. Runs inline on the reader thread; never waits.
+    def schedule_timer(source, request, release_response)
+      after = request[:after]
+      every = request[:every]
+      raise ArgumentError, "schedule needs after: or every:" if after.nil? && every.nil?
+      raise ArgumentError, "after must be a non-negative number" unless after.nil? || non_negative_number?(after)
+      unless every.nil? || (valid_timeout?(every) && every >= MIN_TIMER_INTERVAL)
+        raise ArgumentError, "every must be at least #{MIN_TIMER_INTERVAL} seconds"
+      end
+
+      node, timer = @mutex.synchronize do
+        node = source_node(source)
+        if node.timers.size >= MAX_TIMERS_PER_ACTOR
+          raise Error,
+                "actor #{node.path} already has #{MAX_TIMERS_PER_ACTOR} timers"
+        end
+
+        record = TimerRecord.new(SecureRandom.hex(16), request[:message], every)
+        node.timers[record.id] = record
+        [node, record]
+      end
+      if (error = failure_for(enqueue_task(delay: after || every) { fire_timer(node, timer.id) }))
+        @mutex.synchronize { node.timers.delete(timer.id) }
+        raise error
+      end
+      respond(source, request[:request_id], Timer.new(timer.id), release_response)
+    rescue StandardError => error
+      respond_error(source, request[:request_id], error, release_response)
+    end
+
+    def cancel_timer(source, request, release_response)
+      cancelled = @mutex.synchronize do
+        node = node_for(source)
+        node ? !node.timers.delete(request[:timer_id]).nil? : false
+      end
+      respond(source, request[:request_id], cancelled, release_response)
+    rescue StandardError => error
+      respond_error(source, request[:request_id], error, release_response)
+    end
+
+    # Runs on the service thread. Delivers the timer's message as a tell from
+    # the actor to itself, then re-arms a recurring timer. A timer whose
+    # incarnation has ended is no longer in node.timers and does nothing. A
+    # tell that fails is reported, except when the actor has just stopped,
+    # which its lifecycle event already reports; a recurring timer tries again
+    # next interval either way, unless the broker has stopped meanwhile.
+    def fire_timer(node, id)
+      record, reference = @mutex.synchronize do
+        record = node.timers[id]
+        next [nil, nil] unless record && node.active? && node.reference # none while a failed relaunch boot settles
+
+        node.timers.delete(id) unless record.every
+        [record, node.reference]
+      end
+      return unless record
+
+      begin
+        reference.tell(record.message, ActorHandle.new(node.id, broker: self))
+      rescue ActorStoppedError
+        nil
+      rescue StandardError => error
+        ErrorReporting.report(@error_handler, error, "scheduled tell to #{node.id}")
+      end
+      return unless record.every
+
+      return if enqueue_task(delay: record.every) { fire_timer(node, id) } == true
+
+      @mutex.synchronize { node.timers.delete(id) } # the broker is stopping
+    end
+
+    # === Watches and lifecycle events ========================================
+
+    # Subscribes the requesting actor to the watched actor's lifecycle events.
+    # Watching an actor that is already terminal delivers that event at once.
+    def watch(source, request, release_response)
       @mutex.synchronize do
-        @expiries[future] = [deadline, timeout]
-        wake_service
+        watcher = source_node(source)
+        watched = @nodes[request[:handle_id]] or raise Error, "unknown actor handle"
+        if watched.terminal?
+          detail = { reason: watched.failure&.message || watched.exit&.to_s, generation: watched.generation }
+          @event_dispatcher.emit(watched.id, watched.state, detail, [watcher.id], notify_application: false)
+        else
+          watched.watchers[watcher.id] = true
+        end
+      end
+      respond(source, request[:request_id], true, release_response)
+    rescue StandardError => error
+      respond_error(source, request[:request_id], error, release_response)
+    end
+
+    def unwatch(source, request, release_response)
+      removed = @mutex.synchronize do
+        watcher = node_for(source)
+        watched = @nodes[request[:handle_id]]
+        watcher && watched ? !watched.watchers.delete(watcher.id).nil? : false
+      end
+      respond(source, request[:request_id], removed, release_response)
+    rescue StandardError => error
+      respond_error(source, request[:request_id], error, release_response)
+    end
+
+    # Caller holds @mutex. Queues delivery of a lifecycle event to the
+    # application's on_event and to every watcher of the node. Delivery runs on
+    # the event thread, outside every lock.
+    def emit(node, event, reason, watcher_ids = node.watchers.keys)
+      @event_dispatcher.emit(node.id, event, { reason: reason, generation: node.generation }, watcher_ids)
+    end
+
+    def deliver_event(node_id, event, detail, watcher_ids, notify_application)
+      handle = ActorHandle.new(node_id, broker: self)
+      ErrorReporting.guard(@error_handler, "on_event") { @on_event&.call(event, handle, detail) } if notify_application
+      watcher_ids.each do |watcher_id|
+        reference = @mutex.synchronize do
+          watcher = @nodes[watcher_id]
+          watcher&.active? ? watcher.reference : nil
+        end
+        next unless reference
+
+        begin
+          reference.tell(Protocol.request(:actor_event, event: event, actor: handle, reason: detail[:reason],
+                                                        generation: detail[:generation]), nil)
+        rescue StandardError => error
+          ErrorReporting.report(@error_handler, error, "event to #{watcher_id}")
+        end
       end
     end
 
-    def cancel_expiry(future)
-      @mutex.synchronize { @expiries.delete(future) }
+    # Caller holds @mutex. Why the incarnation behind this reference ended, or
+    # nil if it has not reported anything.
+    def exit_reason(reference)
+      reference&.exit_error&.message || reference&.exit_status&.to_s
+    end
+
+    # === Launching an actor and settling its boot ============================
+
+    # Starts the process and registers it as :starting. Returns [node, boot];
+    # the caller must settle the boot future exactly once.
+    def launch_node(actor_class, arguments, parent_id:, name:, options:)
+      name = validate_name(name)
+      @mutex.synchronize { check_placement(parent_id, name) } # cheap rejection before a /proc scan and a process
+      id = SecureRandom.hex(16)
+      reference, boot = launch_process(actor_class, arguments, id, options.launch)
+      spec = { actor_class: actor_class, arguments: arguments, options: options.launch,
+               start_timeout: options.start_timeout }
+      node = register(id, reference, parent_id, name, spec, options.policy)
+      reference.attach_broker(self)
+      reference.on_exit { actor_exited(node, reference) }
+      [node, boot]
+    rescue Exception # rubocop:disable Lint/RescueException
+      reference&.stop(force: true, timeout: 0)
+      unregister(node) if node
+      raise
+    end
+
+    # Every actor process starts here. Refuses, before paying for a process,
+    # when the user's process limit leaves no room for one more actor.
+    # A connection whose threads cannot be created (the preflight can only
+    # estimate) fails this launch the same way, with ResourceLimitError; the
+    # actors already running keep their threads.
+    def launch_process(actor_class, arguments, actor_id, launch_options)
+      ProcessBudget.check!(@process_margin) if @process_margin
+      Launcher.launch(actor_class, *arguments, context: { actor_id: actor_id }, **launch_options)
+    end
+
+    def register(id, reference, parent_id, name, spec, policy)
+      @mutex.synchronize do
+        parent = check_placement(parent_id, name)
+        name ||= id
+        path = parent ? "#{parent.path}/#{name}" : name
+        node = ActorNode.new(
+          id: id, name: name, path: path, parent_id: parent_id, reference: reference,
+          spec: spec, policy: policy
+        )
+        @nodes[id] = node
+        reference.actor_id = id
+        parent&.children&.push(id)
+        node
+      end
+    end
+
+    # Caller holds @mutex. Returns the parent node, or nil for a root.
+    def check_placement(parent_id, name)
+      raise stopped_error if @stopped
+
+      parent = nil
+      if parent_id
+        parent = @nodes[parent_id] or raise Error, "unknown parent actor handle"
+        raise ActorStoppedError, "parent actor #{parent.path} is #{parent.state}" unless parent.active?
+      end
+      siblings = parent ? parent.children : @nodes.values.select { |node| node.parent_id.nil? }.map(&:id)
+      taken = name && siblings.any? { |id| (sibling = @nodes[id]) && !sibling.terminal? && sibling.name == name }
+      raise ArgumentError, "actor name #{name.inspect} is already in use" if taken
+
+      parent
+    end
+
+    def validate_name(name)
+      return nil if name.nil?
+
+      name = name.to_s
+      raise ArgumentError, "actor name must not be empty" if name.empty?
+      raise ArgumentError, "actor name must not contain '/'" if name.include?("/")
+
+      name
+    end
+
+    # Arms the boot deadline and settles the node exactly once when its boot
+    # future resolves, on whichever thread resolves it. The block receives the
+    # error to raise or send, or nil on success.
+    def await_boot(node, boot, start_timeout)
+      if (error = failure_for(schedule_expiration(boot, start_timeout)))
+        boot.reject(error)
+      end
+      boot.on_resolve do |_result, error|
+        cancel_expiration(boot)
+        yield settle(node, error)
+      end
+    end
+
+    # Ends a boot, first or relaunch. Success moves the node to :running (and
+    # announces a relaunch). Failure kills the process; a first boot is then
+    # unregistered with any children it spawned while booting, while a failed
+    # relaunch counts as another failure under the restart policy. Returns the
+    # error a spawner should see, or nil.
+    def settle(node, error)
+      first_boot, children, exited, reference, overtaken = @mutex.synchronize do
+        next [nil, [], false, nil, false] unless node.booting
+
+        first_boot = node.first_boot?
+        # A stop that reached a boot that failed is the outcome the spawner
+        # learns. A boot that succeeds while a stop is in flight is left to
+        # that stop: boot_succeeded declines it and the spawner gets its
+        # handle, as when the stop lands a moment later.
+        overtaken = error && (node.state == :stopping || node.terminal?)
+        if error
+          # Detaching the reference first means the reaper, seeing an exit from
+          # a reference the node no longer holds, leaves this failure to us. A
+          # first boot is unregistered in the same step, so no sweep can find a
+          # node without a reference.
+          exit_observed = node.boot_exit.equal?(node.reference)
+          dead = node.boot_failed
+          @killed_references[dead] = true if dead && !exit_observed # killed below without waiting
+          children = live_children(node)
+          if first_boot
+            unregister_locked(node)
+          elsif error.is_a?(RemoteError)
+            node.record_failure(error)
+          end
+          [first_boot, children, false, dead, overtaken]
+        else
+          if node.boot_succeeded(Process.clock_gettime(Process::CLOCK_MONOTONIC)) && !first_boot
+            emit(node, :restarted,
+                 nil)
+          end
+          [first_boot, [], node.boot_exit&.equal?(node.reference), nil, false]
+        end
+      end
+      # The process died after replying ready but before we settled: the actor
+      # is registered and running from the caller's view, so treat it as a crash.
+      actor_failed(node) if exited
+      return nil unless error
+
+      reference&.kill # without waiting: this may be the scheduler thread
+      if first_boot
+        stop_later(children)
+        overtaken ? node_error_for(node) : Launcher.startup_error(reference, error)
+      else
+        actor_failed(node)
+        nil
+      end
+    end
+
+    def unregister(node)
+      @mutex.synchronize { unregister_locked(node) }
+    end
+
+    # Caller holds @mutex. Removes a node that never finished booting; its id
+    # is known only to the dead process, so no handle can refer to it. It ends
+    # :stopped when a stop had reached it (that stop would have retired it),
+    # :failed otherwise.
+    def unregister_locked(node)
+      retire(node, node.state == :stopping ? :stopped : :failed) unless node.terminal?
+      @nodes.delete(node.id)
+      @nodes[node.parent_id]&.children&.delete(node.id)
+    end
+
+    # === Exit, restart, and stopping =========================================
+
+    # Called from the actor's reaper thread once its process has exited. Exits
+    # during a boot are settled by the boot future's owner instead.
+    def actor_exited(node, reference)
+      @mutex.synchronize do
+        @killed_references.delete(reference) # its exit is observed
+        return if node.terminal? || !node.reference.equal?(reference)
+
+        if node.booting
+          node.record_boot_exit(reference)
+          return
+        end
+        if node.state == :stopping
+          retire(node, :stopped)
+          return
+        end
+      end
+      actor_failed(node)
+    end
+
+    # Applies the restart policy to a running or restarting actor whose process
+    # is gone: schedules a relaunch, or marks it :failed. Either way its live
+    # descendants are stopped; a restarted actor recreates them in initialize.
+    def actor_failed(node)
+      delay, children = @mutex.synchronize do
+        next [nil, []] if node.terminal? || node.state == :stopping
+
+        # Mark the whole live subtree now so it rejects messages before the
+        # service thread gets to it; stop_subtrees re-derives the order itself.
+        live_postorder(node).each { |descendant| descendant.begin_stopping unless descendant.equal?(node) }
+        live = live_children(node)
+        delay = restart_delay(node)
+        release_incarnation(node)
+        if delay
+          node.begin_restarting
+          emit(node, :restarting, exit_reason(node.reference))
+        else
+          retire(node, :failed)
+        end
+        [delay, live]
+      end
+      stop_later(children)
+      return unless delay
+
+      # :stopped only when the broker is stopping, and then its sweep has retired the node.
+      enqueue_task(delay: delay) { enqueue_lifecycle_job { relaunch(node) } }
+      nil
+    end
+
+    # Caller holds @mutex. Records a restart attempt and returns its backoff
+    # delay, or nil when the policy forbids restarting now. The count is of
+    # consecutive failures and resets only after the actor has run for
+    # restart_window seconds, so backoff delays (time not running) can never
+    # prune failures out of the window and defeat max_restarts.
+    def restart_delay(node)
+      return nil if @stopped || node.policy[:restart] == :never
+
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      attempt = node.record_restart_attempt(now, node.policy[:restart_window])
+      return nil unless attempt
+
+      node.policy[:restart_backoff] * (2**(attempt - 1))
+    end
+
+    # Runs on a lifecycle thread. Replaces the node's dead reference with a new
+    # process under the same id, path, and name, and bumps the generation.
+    def relaunch(node)
+      spec = @mutex.synchronize { node.state == :restarting ? node.spec : nil }
+      return unless spec
+
+      reference, boot = launch_process(spec[:actor_class], spec[:arguments], node.id, spec[:options])
+      installed = @mutex.synchronize do
+        next false unless node.state == :restarting
+
+        node.install_restarted_reference(reference)
+        reference.actor_id = node.id
+        true
+      end
+      unless installed
+        reference.stop(force: true, timeout: 0)
+        return
+      end
+
+      reference.attach_broker(self)
+      reference.on_exit { actor_exited(node, reference) }
+      await_boot(node, boot, spec[:start_timeout]) { |_error| nil }
+    rescue Exception => error # rubocop:disable Lint/RescueException -- the node must not be left half-relaunched
+      ErrorReporting.report(@error_handler, error, "relaunch of #{node.path}")
+      actor_failed(node)
+    end
+
+    # Force-stops nodes on the lifecycle pool: stopping waits on processes, and
+    # the scheduler thread must stay free to run route expirations on time.
+    def stop_later(nodes)
+      return if nodes.empty?
+
+      enqueue_lifecycle_job { stop_subtrees(nodes, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true) }
+    end
+
+    def stop_subtrees(roots, timeout:, force:)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      nodes = @mutex.synchronize do
+        roots.flat_map { |root| live_postorder(root) }.uniq.map do |node|
+          node.begin_stopping
+          [node, node.reference]
+        end
+      end
+      nodes.map do |node, reference|
+        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        # A relaunch whose boot just failed has no reference until actor_failed
+        # applies the policy; being stopped first is a valid outcome for it.
+        stopped = reference.nil? || reference.stop(timeout: [remaining, 0].max, force: force || remaining <= 0)
+        @mutex.synchronize { retire(node, :stopped) if node.state == :stopping }
+        stopped
+      end.all?
+    end
+
+    # Caller holds @mutex. Moves a node to a terminal state and releases what
+    # only a live actor needs: the reference (threads, socket) and the relaunch
+    # spec. The node itself stays so its handle keeps answering with its state.
+    def retire(node, state)
+      release_incarnation(node)
+      reason = exit_reason(node.reference)
+      watcher_ids = node.watchers.keys
+      node.retire(state) # clears the node's own watchers: a terminal event ends them
+      emit(node, state, reason, watcher_ids)
+    end
+
+    # === The node graph ======================================================
+    # Every method here is called with @mutex held unless it says otherwise.
+
+    # Caller holds @mutex.
+    def fetch_node(id)
+      @nodes[id] or raise Error, "unknown actor handle"
+    end
+
+    # Caller holds @mutex. Returns the node only when it accepts messages.
+    def checked_node(id)
+      node = @nodes[id]
+      error = node_error(node)
+      raise error if error
+
+      node
+    end
+
+    # Caller holds @mutex. Why a node cannot take a message now, or nil.
+    def node_error(node)
+      return Error.new("unknown actor handle") unless node
+
+      case node.state
+      when :starting, :running then nil
+      when :restarting then ActorRestartingError.new("actor #{node.path} is restarting")
+      when :failed then ActorFailedError.new("actor #{node.path} failed")
+      else ActorStoppedError.new("actor #{node.path} is #{node.state}")
+      end
+    end
+
+    def node_error_for(node)
+      @mutex.synchronize { node_error(node) }
+    end
+
+    # Caller holds @mutex. The node a source reference currently belongs to, or
+    # nil when the reference is not (or no longer) a node's live connection.
+    def node_for(source)
+      node = source.actor_id && @nodes[source.actor_id]
+      node if node&.reference.equal?(source)
     end
 
     # Caller holds @mutex.
-    def push_task_locked(delay: 0, &block)
-      return if @stopped
+    def source_node(source)
+      node = node_for(source) or raise Error, "unknown source actor"
+      raise ActorStoppedError, "actor #{node.path} is #{node.state}" unless node.active?
 
-      @tasks << [Process.clock_gettime(Process::CLOCK_MONOTONIC) + delay, block]
-      wake_service
+      node
     end
 
-    def enqueue_task(delay: 0, &block)
-      @mutex.synchronize do
-        next if @stopped
+    # Caller holds @mutex. The handle of the actor behind a source reference.
+    def sender_handle(source)
+      id = node_for(source)&.id
+      id && ActorHandle.new(id, broker: self)
+    end
 
-        @tasks << [Process.clock_gettime(Process::CLOCK_MONOTONIC) + delay, block]
-        wake_service
+    # Caller holds @mutex. The node's children that are not terminal. A child
+    # unregistered after its parent was leaves its id behind.
+    def live_children(node)
+      node.children.filter_map { |child_id| @nodes[child_id] }.reject(&:terminal?)
+    end
+
+    # Caller holds @mutex. Live descendants first, deepest first, then the node.
+    def live_postorder(node)
+      live_children(node).flat_map { |child| live_postorder(child) } + (node.terminal? ? [] : [node])
+    end
+
+    # Caller holds @mutex.
+    def descendant?(node, ancestor_id)
+      while (parent_id = node.parent_id)
+        return true if parent_id == ancestor_id
+
+        node = @nodes[parent_id] or return false
       end
+      false
     end
 
-    # Caller holds @mutex. One thread per broker runs route expiries and
-    # lifecycle tasks so no actor thread blocks on another actor's shutdown.
-    def wake_service
-      @service = start_service unless @service&.alive?
-      @service_condition.signal
+    # Caller holds @mutex.
+    def describe_node(node)
+      {
+        id: node.id, path: node.path, name: node.name, state: node.state, generation: node.generation,
+        parent_id: node.parent_id, children: node.children.dup, pid: node.reference&.pid,
+        restarts: node.restarts, waiting_on: @waiting[node.id], watchers: node.watchers.keys,
+        timers: node.timers.size,
+        last_exit: (node.reference&.exit_status || node.exit)&.to_s,
+        last_failure: (node.reference&.exit_error || node.failure)&.message
+      }
     end
 
-    def start_service
-      service = Thread.new do
-        Thread.current.report_on_exception = false
-        run_service
-      end
-      service.name = "rocoto-actor-broker" if service.respond_to?(:name=)
-      service
+    # Caller holds @mutex. Ends what only this incarnation of the node holds:
+    # its timers, the watches it placed on others, and any call it was blocked
+    # in. Others' watches on the node itself persist across a restart.
+    def release_incarnation(node)
+      node.timers.clear
+      @nodes.each_value { |other| other.watchers.delete(node.id) }
+      @waiting.delete(node.id)
     end
 
-    def run_service
-      loop do
-        expired, tasks = @mutex.synchronize do
-          loop do
-            break if @stopped
+    # === Small helpers =======================================================
 
-            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-            due = @expiries.select { |_future, (deadline, _timeout)| deadline <= now }
-            ready, @tasks = @tasks.partition { |run_at, _block| run_at <= now }
-            unless due.empty? && ready.empty?
-              due.each_key { |future| @expiries.delete(future) }
-              break [due, ready.map(&:last)]
-            end
-
-            next_deadline = (@expiries.each_value.map(&:first) + @tasks.map(&:first)).min
-            @service_condition.wait(@mutex, next_deadline && (next_deadline - now))
-          end
-        end
-        return unless expired
-
-        expired.each { |future, (_deadline, timeout)| guarded("route expiry") { future.expire(timeout) } }
-        tasks.each { |task| guarded("service task") { task.call } }
-      end
+    def valid_timeout?(timeout)
+      timeout.is_a?(Numeric) && timeout.positive? && timeout.to_f.finite?
     end
 
-    # Runs one unit of service work; a StandardError is reported and the thread
-    # continues. Anything worse still ends the thread, which wake_service replaces.
-    def guarded(context)
-      yield
-    rescue StandardError => error
-      report_error(error, context)
+    def non_negative_number?(value)
+      value.is_a?(Numeric) && value >= 0 && value.to_f.finite?
+    end
+
+    def stopped_error
+      ActorStoppedError.new("actor broker is stopped")
+    end
+
+    # An executor's answer as the error to fail the work with, or nil when
+    # the work was taken: a stopped executor means the broker is stopping.
+    def failure_for(result)
+      result == :stopped ? stopped_error : nil
+    end
+
+    def schedule_expiration(future, timeout)
+      @scheduler.schedule_expiration(future, timeout) { |expiration_timeout| future.expire(expiration_timeout) }
+    end
+
+    def cancel_expiration(future)
+      @scheduler.cancel_expiration(future)
+    end
+
+    def enqueue_task(delay: 0, &)
+      @scheduler.enqueue(delay: delay, &)
     end
   end
 end

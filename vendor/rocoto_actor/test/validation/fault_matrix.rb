@@ -485,7 +485,7 @@ class FaultMatrix
              end
       frame = [random.rand(0..1).zero? ? body.bytesize : random.rand(0..((2**32) - 1))].pack("N") + body
       begin
-        TRANSPORT.read(StringIO.new(frame), timeout: 0.5)
+        TRANSPORT.read(StringIO.new(frame))
         classes[:decoded] += 1
       rescue RocotoActor::Error, EOFError => error
         classes[error.class.name.split("::").last.to_sym] += 1
@@ -572,30 +572,48 @@ class FaultMatrix
 
     script = <<~RUBY
       require "rocoto_actor"; require "#{File.expand_path('../support/example_actor', __dir__)}"
-      broker = RocotoActor::ActorBroker.new(error_handler: ->(*) {})
+      reported = []
+      broker = RocotoActor::ActorBroker.new(error_handler: ->(e, c) { reported << "\#{c}: \#{e.class}" }, process_margin: nil)
       actors = []
+      failed_at = nil
       error = nil
       begin
         60.times { |i| actors << broker.spawn(ExampleActor, "p", name: "p\#{i}", start_timeout: 10) }
       rescue StandardError => e
+        failed_at = "spawn"
         error = e
       end
-      broker.stop(timeout: 10, force: true)
-      puts JSON.generate(spawned: actors.size, error: error&.class&.name, message: error&.message.to_s[0, 80])
+      begin
+        broker.stop(timeout: 10, force: true)
+      rescue StandardError => e
+        failed_at ||= "stop"
+        error ||= e
+      end
+      puts JSON.generate(spawned: actors.size, failed_at: failed_at, error: error&.class&.name,
+                         message: error&.message.to_s[0, 80], reported: reported.uniq.first(3))
     RUBY
     output, status = limited("--nproc=#{threshold + 40}:#{threshold + 40}", script, allow_hang: true)
-    if status.exitstatus == 137
-      raise Note, "Ruby wedged in a futex when thread creation hit RLIMIT_NPROC (#{threshold + 40}) and " \
-                  "ignored TERM; KILL removed it. Deployment must keep process limits above need; " \
-                  "the library cannot recover a wedged VM."
+    # GNU timeout exits 124 when its limit expires (137 if the shell reports the KILL instead).
+    if [124, 137].include?(status.exitstatus)
+      raise Note, "Ruby wedged when thread creation hit RLIMIT_NPROC (#{threshold + 40}): no output for 30s, " \
+                  "KILL removed it. The preflight exists to avoid this; the library cannot recover a wedged VM."
     end
+    if output.strip.empty? && !status.success?
+      raise Note, "Ruby exited #{status.exitstatus} before printing anything under RLIMIT_NPROC=#{threshold + 40}"
+    end
+
     check(status.success?, "exhaustion script failed: #{output.lines.last(3).join.strip}")
     result = JSON.parse(output.lines.last)
-    note = if result["error"]
-             "spawn failed cleanly"
+    note = if result["failed_at"] == "stop"
+             "stop raised; thread exhaustion must never escape from stop"
+           elsif result["error"] == "RocotoActor::ResourceLimitError"
+             "#{result['failed_at']} refused with ResourceLimitError and stop returned"
+           elsif result["error"]
+             "#{result['failed_at']} failed cleanly"
            else
              "limit not enforced for this user (root bypasses RLIMIT_NPROC); no failure to observe"
            end
+    check(result["failed_at"] != "stop", note)
     "#{result} #{note}"
   end
 

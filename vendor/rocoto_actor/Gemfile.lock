@@ -11,7 +11,7 @@ GEM
     language_server-protocol (3.17.0.6)
     lint_roller (1.1.0)
     minitest (5.25.4)
-    parallel (1.28.0)
+    parallel (2.2.0)
     parser (3.3.12.0)
       ast (~> 2.4.1)
       racc
@@ -45,7 +45,6 @@ PLATFORMS
 
 DEPENDENCIES
   minitest (~> 5.0)
-  parallel (~> 1.28)
   rake (~> 13.0)
   rocoto_actor!
   rubocop (~> 1.80)

@@ -74,6 +74,8 @@ Actors process one message at a time. `ask` serializes and places a message in a
 
 Actors run in fresh Ruby processes. The actor class must be named and defined in a dedicated file that can be loaded independently without starting the application or performing other process-wide side effects. `spawn` normally locates the defining file automatically, or it can be specified with `broker.spawn(Worker, source: "/path/to/worker.rb")`. The startup exchange has a five-second deadline by default; use `start_timeout:` to change it.
 
+Only that one file is loaded into the new process, and a new process inherits the application's environment but not its in-process `$LOAD_PATH`. If the actor's file requires other application code, those requires must resolve on their own: through `RUBYLIB`, through Bundler (a child inherits `RUBYOPT` and `BUNDLE_GEMFILE`, so it resolves the same bundle), or by the file setting up its own load path before requiring. This matters most when the library is vendored inside a larger application whose load path is built at runtime.
+
 Only the actor's Unix socket is passed into the new process, avoiding inherited Ruby locks, threads, connections, and unrelated file descriptors. Standard input, output, and error are connected to `/dev/null`; actors should return diagnostics through the protocol or use an explicitly configured logging destination.
 
 Each actor has a small watchdog process that remains a normal child of the application and owns a dedicated process group containing the actor worker. The watchdog detects worker or application death and terminates the group, including subprocesses launched by the actor; it holds no restart policy, which belongs to the broker. Actors are not daemonized and do not call `setsid`. A subprocess that deliberately creates another session or process group escapes this containment.
@@ -172,7 +174,7 @@ class SupervisorActor
 end
 ```
 
-The event arrives as a tell from the broker (`context.sender` is `nil`). A watch lasts until the watched actor stops or fails for good, or until the watching incarnation ends; a restarted watcher must watch again, just as it respawns its children. Watching an actor that has already stopped or failed delivers that event immediately. `context.unwatch(handle)` ends a watch early. The application sees the same events through `RocotoActor::ActorBroker.new(on_event: ->(event, handle, detail) { ... })`, with `detail[:reason]` and `detail[:generation]`. It is called on the broker's event thread, in order; a slow handler delays later events but nothing else. Watching an actor that has already ended replays its final event to that watcher only, not to `on_event`.
+The event arrives as a tell from the broker (`context.sender` is `nil`). A watch lasts until the watched actor stops or fails for good, or until the watching incarnation ends; a restarted watcher must watch again, just as it respawns its children. Watching an actor that has already stopped or failed delivers that event immediately. `context.unwatch(handle)` ends a watch early. The application sees the same events through `RocotoActor::ActorBroker.new(on_event: ->(event, handle, detail) { ... })`, with `detail[:reason]` and `detail[:generation]`. It is called on the broker's event thread, in order; a slow handler delays later events but nothing else. Watching an actor that has already ended replays its final event to that watcher only, not to `on_event`. `broker.stop` delivers no events for the actors it stops: the application asked for the shutdown, and the watchers are being stopped with them.
 
 ### Shutting down cleanly
 
@@ -238,17 +240,28 @@ Inside an actor a handle supports `call` and `stop` only. `ask` returns a `Rocot
 
 `broker.describe` returns a plain-data snapshot for operators: broker counters (routes in flight, timers, queued lifecycle requests) and, per actor, its path, state, generation, pid, restart count, what it is waiting on, its watchers and timers, and its last exit reason and failure.
 
-The broker's own threads never die silently: a failure while running a route expiry, a scheduled task, or an actor's spawn/stop request is passed to the broker's `error_handler:` (a callable receiving the error and a short context string; the default writes one line to the application's standard error) and the thread carries on. Replace it to route these into your logging.
+The broker's own threads never die silently: a failure while running a route expiration, a scheduled task, or an actor's spawn/stop request is passed to the broker's `error_handler:` (a callable receiving the error and a short context string; the default writes one line to the application's standard error) and the thread carries on. Replace it to route these into your logging.
 
 Routing is bounded and does not create a thread per request. `RocotoActor::ActorBroker.new(max_routes: 1_000, max_routes_per_actor: 100)` limits requests awaiting a target across the broker and unwritten responses owed to one actor. A request beyond `max_routes` fails with `RocotoActor::BrokerBusyError`; an actor at `max_routes_per_actor` is not read from until its responses drain, without affecting other actors.
 
 If the application exits, the watchdog detects it within 100 milliseconds and terminates the actor group independently of the worker's state. A process blocked in uninterruptible kernel sleep remains until the kernel operation returns, but the application does not wait for it.
+
+## Deployment
+
+Each actor costs two operating-system processes (the watchdog and the worker) and three threads in the application (socket reader, socket writer, and reaper), about seven kernel tasks in all; the broker adds a few shared threads. An application with three actors is therefore seven processes and roughly 26 tasks. Every task counts against the user's process limit (`ulimit -u`, `RLIMIT_NPROC`), which is measured across everything the user runs on the machine, and reaching it is not graceful: Ruby can block in a futex and ignore `TERM`. The broker therefore checks before every launch, including actor-initiated spawns and restarts, that one more actor plus a margin still fits, and raises `RocotoActor::ResourceLimitError` (actors see it as a `RemoteError`) instead of starting a process that may wedge the system. `RocotoActor::ActorBroker.new(process_margin: 32)` sets the margin; `nil` disables the check. The count comes from `/proc`, so nothing is forked to make it; where `/proc` is absent or the limit is unlimited no check is made, and inside a container the count covers only what the container can see. `broker.describe[:process_limit]` reports the limit, the tasks in use, and the margin.
+
+The preflight is an estimate, and other processes of the same user can take the headroom it measured. The broker never needs a new thread of its own after construction: its scheduler, event, and first lifecycle threads are created by `RocotoActor::ActorBroker.new`, which raises `ResourceLimitError` if they cannot be, and a second lifecycle worker that cannot be created only leaves the pool smaller. If a new actor's own threads cannot be created, that spawn or relaunch fails with `ResourceLimitError` exactly as a preflight refusal does (an actor's spawn request sees it as a `RemoteError`), and the actors already running are unaffected. A relaunch refused by the preflight or by thread creation counts against `max_restarts` like a crash; with short-lived runs that is preferable to an unbounded wait for headroom.
+
+Accepted limitations, all recorded with their evidence in `docs/linux-validation.md`: a process in uninterruptible `D` state cannot be killed until the kernel releases it (`stop` returns `false` after its grace); a subprocess that creates its own session or process group escapes containment; and process-limit exhaustion is avoided rather than survived.
 
 ## Security boundary
 
 RocotoActor is a reliability bulkhead, not a sandbox for hostile code. Actor workers run under the application's user identity and inherit its environment, working directory, resource limits, and filesystem and network permissions. Only run trusted actor code. Use operating-system controls such as containers, service accounts, namespaces, sandbox profiles, or restricted environment variables when actors require a security boundary.
 
 ## Development
+
+See [docs/architecture.md](docs/architecture.md) for the process model,
+component responsibilities, thread ownership, and concurrency rules.
 
 ```sh
 bundle install
@@ -264,4 +277,4 @@ SOAK_SECONDS=1800 bundle exec ruby -Ilib test/soak/soak.rb
 bundle exec ruby -Ilib test/validation/fault_matrix.rb
 ```
 
-CI runs lint and the suite on Ruby 3.2 through 3.4 on Ubuntu, plus Ruby 3.4 on macOS, and can run the soak on demand.
+CI runs lint and the suite on Ruby 3.3 and 3.4 on Ubuntu, plus Ruby 3.4 on macOS, and can run the soak on demand.

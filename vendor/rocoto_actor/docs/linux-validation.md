@@ -43,7 +43,7 @@ Primary implementation files:
 
 - `SIGTERM` and `SIGKILL` do not take effect while a process remains in `D` state. The parent application must nevertheless stay responsive and `stop` must return `false` once its deadline and the kill-confirmation grace have passed.
 - A subprocess can escape process-group containment by deliberately creating a new session or process group (confirmed by probe P5).
-- Ruby itself can wedge under `RLIMIT_NPROC`: when thread creation fails at the limit, the VM sometimes blocks in a futex and ignores `TERM`; only `KILL` removes it. Observed twice while writing the fault matrix and not reproduced on the recorded run, where spawn failed cleanly with `ThreadError`. The library cannot recover a wedged VM; deployments must keep process limits above need (for example a cgroup `pids.max` with headroom) and rely on `KILL`.
+- Ruby itself can wedge under `RLIMIT_NPROC`: when thread creation fails at the limit, the VM sometimes blocks in a futex and ignores `TERM`; only `KILL` removes it. Observed twice while writing the fault matrix and not reproduced on the recorded run, where spawn failed cleanly with `ThreadError`. The library cannot recover a wedged VM, so it avoids the limit instead: `ProcessBudget` refuses every launch (application spawn, actor spawn, relaunch) that would leave less than `process_margin` tasks under the soft limit, raising `ResourceLimitError`. If a new actor's threads cannot be created anyway, that launch fails with `ResourceLimitError` like a refusal; the broker's own threads exist from construction, so it never needs one later. On a login node with `ulimit -u 1024`, one actor costs about 7 tasks and an application with three actors about 26.
 - `RLIMIT_NPROC` counts the uid's processes and threads on the whole host, so a container cannot compute a meaningful limit for it; the fault matrix finds one by probing.
 - Actors run with the application's UID, environment, working directory, resource limits, and filesystem/network access.
 - A timed-out future does not cancel work. Late responses are discarded.
@@ -72,13 +72,13 @@ Suite: `110 runs, 412 assertions, 0 failures` with RuboCop clean, on Ruby 3.4.10
 | T3 3,000 fuzzed frames | pass | only `SerializationError`, `Error`, `EOFError`, or a decode; never another exception |
 | T4 parent RSS while filling a 4 MiB mailbox | pass | +4.3 MB, released after stop |
 | T5 `RLIMIT_NOFILE` = 48 | pass | 37 actors, then `Errno::EMFILE` raised cleanly; broker recovered after freeing descriptors |
-| T5 `RLIMIT_NPROC` at probed threshold + 40 | pass (this run) | 30 actors, then `ThreadError` raised cleanly; see accepted limitations for the wedge seen on other runs |
+| T5 `RLIMIT_NPROC` at probed threshold + 40 | pass (this run) | 30 actors, then `ThreadError` raised cleanly during spawn; the probe runs with the preflight disabled and passes on a clean failure during spawn, fails if `stop` raises, and notes a wedge; see accepted limitations |
 | T6 descriptors in worker and watchdog | pass | `/dev/null` ×3, one anonymous socket, Ruby's eventfd and epoll only |
 | D1 `SIGSTOP`ped worker | pass | ask times out terminally, other actors responsive, `stop` confirms the `KILL` |
 | S1 socket | pass | `socketpair`, no filesystem path |
 | S4 50,000 decoded symbols | pass | mortal dynamic symbols 111 → 50,111 → 111 after GC |
 
-Cases covered by the normal suite rather than the matrix: startup timeout with a boot that ignores `TERM`; socket back-pressure not blocking `ask` or `stop`; descendants ignoring `TERM` removed by group `KILL`; worker exit with an inherited socket; application death with background children; codec rejection of unsupported values, cycles, invalid UTF-8, oversized frames, and non-finite floats; read timeouts across partial frames.
+Cases covered by the normal suite rather than the matrix: startup timeout with a boot that ignores `TERM`; socket back-pressure not blocking `ask` or `stop`; descendants ignoring `TERM` removed by group `KILL`; worker exit with an inherited socket; application death with background children; codec rejection of unsupported values, cycles, invalid UTF-8, oversized frames, and non-finite floats; a clean end of stream versus a stream closed mid-frame (there is deliberately no read timeout: a partial frame abandoned on a deadline would desynchronize the stream, so waiting is bounded elsewhere).
 
 Not reproduced here, with reasoning:
 
@@ -199,7 +199,7 @@ An Ubuntu container under Docker Desktop uses the Docker Linux VM kernel. It is 
 
 ## Supported Ruby versions
 
-The gem declares Ruby `>= 3.2`. CI runs lint and the suite on 3.2, 3.3, and 3.4 on Ubuntu and on 3.4 on macOS. Differences in `Process.spawn`, `fork`, JSON, `Thread`, and signal behavior are especially relevant when adding a version.
+The gem declares Ruby `>= 3.3`. CI runs lint and the suite on 3.3 and 3.4 on Ubuntu and on 3.4 on macOS. Differences in `Process.spawn`, `fork`, JSON, `Thread`, and signal behavior are especially relevant when adding a version.
 
 ## Completion criteria
 

@@ -25,21 +25,26 @@ module RocotoActor
     end
 
     # Writes block until the frame is in the socket buffer; the sending side's
-    # mailbox bounds what can queue behind a blocked write.
+    # mailbox bounds what can queue behind a blocked write. The length header is
+    # a binary string and the payload is UTF-8, so they are written as two
+    # arguments rather than concatenated: joining them raises
+    # Encoding::CompatibilityError whenever both carry a byte above 0x7F, which
+    # is every multi-byte payload whose length happens to have a high byte.
     def write_payload(io, payload)
-      io.write([payload.bytesize].pack("N") << payload)
+      io.write([payload.bytesize].pack("N"), payload)
     end
 
-    def read(io, timeout: nil)
-      deadline = timeout && (monotonic_time + timeout)
-      header = read_exactly(io, HEADER_SIZE, deadline: deadline)
+    # Blocks until a whole frame arrives; nil at a clean end of stream. There is
+    # deliberately no read timeout: a partial frame abandoned on a deadline
+    # would desynchronize the stream, so callers bound waiting elsewhere.
+    def read(io, bindings: DecodeBindings.new)
+      header = read_exactly(io, HEADER_SIZE)
       return if header.nil?
 
       size = header.unpack1("N")
       raise Error, "invalid frame size: #{size}" if size > MAX_FRAME_SIZE
 
-      Thread.current[:rocoto_actor_transport_socket] = io
-      decode(JSON.parse(read_exactly(io, size, deadline: deadline)))
+      decode(JSON.parse(read_exactly(io, size)), bindings)
     rescue JSON::JSONError => error
       raise SerializationError, error.message
     end
@@ -83,7 +88,7 @@ module RocotoActor
     end
     private_class_method :encode_container
 
-    def decode(value)
+    def decode(value, bindings)
       raise SerializationError, "invalid encoded value" unless value.is_a?(Array)
 
       type, payload = value
@@ -92,17 +97,11 @@ module RocotoActor
       when "boolean", "string", "float" then payload
       when "integer" then Integer(payload, 10)
       when "symbol" then payload.to_sym
-      when "actor_handle"
-        if RocotoActor.worker_process?
-          ActorHandle.new(payload, socket: Thread.current[:rocoto_actor_transport_socket])
-        else
-          ActorHandle.new(payload, broker: Thread.current[:rocoto_actor_broker])
-        end
-      when "timer"
-        Timer.new(payload, socket: RocotoActor.worker_process? ? Thread.current[:rocoto_actor_transport_socket] : nil)
-      when "array" then payload.map { |item| decode(item) }
+      when "actor_handle" then bindings.actor_handle(payload)
+      when "timer" then bindings.timer(payload)
+      when "array" then payload.map { |item| decode(item, bindings) }
       when "hash"
-        payload.to_h { |key, item| [decode(key), decode(item)] }
+        payload.to_h { |key, item| [decode(key, bindings), decode(item, bindings)] }
       else
         raise SerializationError, "unknown encoded type: #{type.inspect}"
       end
@@ -111,18 +110,10 @@ module RocotoActor
     end
     private_class_method :decode
 
-    def read_exactly(io, size, deadline: nil)
+    def read_exactly(io, size)
       buffer = +""
       while buffer.bytesize < size
-        chunk = if deadline
-                  io.read_nonblock(size - buffer.bytesize, exception: false)
-                else
-                  io.read(size - buffer.bytesize)
-                end
-        if chunk == :wait_readable
-          wait_for(io, deadline)
-          next
-        end
+        chunk = io.read(size - buffer.bytesize)
         return if chunk.nil? && buffer.empty?
         raise EOFError, "socket closed during frame" if chunk.nil?
 
@@ -131,19 +122,6 @@ module RocotoActor
       buffer
     end
     private_class_method :read_exactly
-
-    def wait_for(io, deadline)
-      remaining = deadline - monotonic_time
-      raise TransportTimeoutError, "transport read timed out" if remaining <= 0
-
-      raise TransportTimeoutError, "transport read timed out" unless io.wait_readable(remaining)
-    end
-    private_class_method :wait_for
-
-    def monotonic_time
-      Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    end
-    private_class_method :monotonic_time
   end
   private_constant :Transport
 end

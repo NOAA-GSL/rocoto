@@ -8,6 +8,7 @@ module RocotoActor
   class DeadlockError < Error; end
   class AskTimeoutError < Error; end
   class BrokerBusyError < Error; end
+  class ResourceLimitError < Error; end
   class MailboxFullError < Error; end
   class SerializationError < Error; end
   class TransportTimeoutError < Error; end
