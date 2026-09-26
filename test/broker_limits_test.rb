@@ -46,7 +46,10 @@ class BrokerLimitsTest < BrokerTestCase
     PROCESS_BUDGET.stub(:snapshot, NEAR_LIMIT) do
       assert_equal NEAR_LIMIT, @broker.describe[:process_limit]
     end
-    assert_nil RocotoActor::ActorBroker.new(process_margin: nil).describe[:process_limit]
+    unchecked = RocotoActor::ActorBroker.new(process_margin: nil)
+    assert_nil unchecked.describe[:process_limit]
+  ensure
+    unchecked&.stop(timeout: 2, force: true)
   end
 
   def test_relaunch_refused_by_the_limit_is_reported_and_counts_as_a_failure

@@ -2,6 +2,21 @@
 
 require_relative "support/broker_test_case"
 class BrokerChildrenTest < BrokerTestCase
+  # Delays a reference's reader so the reaper observes the process's exit
+  # before the frames it left behind are read. Prepended once; inert unless a
+  # test sets a delay, and it only affects references created while it is set.
+  module SlowReader
+    class << self
+      attr_accessor :delay
+    end
+
+    def read_replies
+      sleep SlowReader.delay if SlowReader.delay
+      super
+    end
+  end
+  RocotoActor.const_get(:Reference).prepend(SlowReader)
+
   def test_actor_spawns_a_child_through_its_context
     supervisor = @broker.spawn(SupervisorActor, name: "sup")
 
@@ -126,6 +141,24 @@ class BrokerChildrenTest < BrokerTestCase
 
     assert_equal "ArgumentError", error.remote_class
     assert_empty supervisor.children
+  end
+
+  # The boot error and the process's exit race each other. When the reaper wins,
+  # the actor's own reason must still be what the spawner sees: rejecting the
+  # boot future first would drop the unread error frame and report the generic
+  # "closed during startup" instead. macOS CI hit this interleaving; the delay
+  # makes it deterministic here.
+  def test_a_failed_boot_reports_its_own_error_when_the_exit_is_observed_first
+    supervisor = @broker.spawn(SupervisorActor, name: "sup")
+    SlowReader.delay = 1.0
+
+    error = assert_raises(RocotoActor::RemoteError) do
+      supervisor.ask(op: :spawn, name: "bad", actor_class: "FailingInitSpawnActor").value(timeout: 10)
+    end
+
+    assert_equal "ArgumentError", error.remote_class
+  ensure
+    SlowReader.delay = nil
   end
 
   def test_malformed_spawn_requests_fail_closed

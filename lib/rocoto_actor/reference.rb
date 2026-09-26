@@ -433,14 +433,18 @@ module RocotoActor
 
     # Runs once on the reaper thread after the watchdog process is reaped.
     def actor_exited
+      # The process is gone, but its last frames may still be unread: a boot
+      # error, an actor_error, the watchdog's exit report. Killing the group
+      # closes every remaining copy of the socket, so the reader reaches EOF.
+      # Draining it before anything is rejected is what makes a request that
+      # failed for a real reason report that reason instead of this method's
+      # generic one; the reader's own shutdown rejects whatever is left.
+      Launcher.signal_process_group(@pid, "KILL")
+      discard_control_outbox
+      join_reader
       pending = enter(:exited) or return
 
       pending.each { |future| future.reject(ActorStoppedError.new("actor process exited")) }
-      discard_control_outbox
-      # Killing the group closes every remaining copy of the socket, so the
-      # reader reaches EOF; let it consume the watchdog's exit report first.
-      Launcher.signal_process_group(@pid, "KILL")
-      join_reader
       close_socket
       # The broker learns of the exit here; nothing above may prevent it.
       @pending_mutex.synchronize { @exit_callbacks }.each(&:call)
