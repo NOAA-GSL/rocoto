@@ -1,0 +1,51 @@
+AllCops:
+  TargetRubyVersion: 3.2
+  NewCops: enable
+  SuggestExtensions: false
+  Exclude:
+    - "vendor/**/*"
+    - "pkg/**/*"
+
+Layout/LineLength:
+  Max: 120
+
+# Method and class size limits fight the shape of a concurrency core, where a
+# state transition is clearest as one method; correctness is reviewed by test.
+Metrics:
+  Enabled: false
+
+Style/Documentation:
+  Enabled: false
+
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+# Tests and support actors are small scripts; allow their bare structure.
+Style/GlobalVars:
+  Exclude:
+    - "test/**/*"
+
+Lint/RescueException:
+  Exclude:
+    - "test/soak/**/*"
+
+Naming/RescuedExceptionsVariableName:
+  PreferredName: error
+
+# The soak and fault-matrix harnesses are operator scripts, not library code.
+Style/FormatStringToken:
+  Exclude:
+    - "test/soak/**/*"
+    - "test/validation/**/*"
+
+Style/SpecialGlobalVars:
+  Exclude:
+    - "test/validation/**/*"
+
+# These are commands that report whether they succeeded, not predicates; a
+# trailing ? would promise no side effects.
+Naming/PredicateMethod:
+  AllowedMethods:
+    - stop_subtrees
+    - expire
+    - wait_for_exit

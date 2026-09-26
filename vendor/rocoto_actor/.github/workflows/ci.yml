@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: "Run the soak harness for this many seconds (0 skips it; at most 20000, see timeout-minutes)"
+        default: "0"
+
+jobs:
+  test:
+    name: Ruby ${{ matrix.ruby }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        ruby: ["3.2", "3.3", "3.4"]
+        include:
+          - os: macos-latest
+            ruby: "3.4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - name: Lint
+        run: bundle exec rubocop
+      - name: Test
+        run: bundle exec rake test
+        timeout-minutes: 15
+
+  soak:
+    name: Soak (manual)
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.soak_seconds != '0'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - name: Soak
+        run: bundle exec ruby -Ilib test/soak/soak.rb
+        env:
+          SOAK_SECONDS: ${{ github.event.inputs.soak_seconds }}
+        # Expressions cannot derive this from soak_seconds; keep it above the
+        # longest soak plus setup. Hosted runners cap a job at 360 minutes.
+        timeout-minutes: 350
