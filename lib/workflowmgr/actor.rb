@@ -220,12 +220,19 @@ module WorkflowMgr
 
       # What a served object logs is often raw output from a scheduler
       # command, which is not necessarily valid UTF-8 and which JSON cannot
-      # write. Scrubbing it here keeps one bad log line from destroying the
-      # reply it was attached to, and copies the string, so later changes to
-      # the caller's own do not follow it across.
+      # write. Approximating what cannot be written keeps one bad log line
+      # from destroying the reply it was attached to, and copies the string,
+      # so later changes to the caller's own do not follow it across.
+      #
+      # Only what is genuinely unwritable is replaced. Converting from binary
+      # instead would treat every byte above 127 as unwritable, so a message
+      # naming a path with an accent in it -- perfectly good UTF-8 -- came
+      # back with each of its characters replaced twice over.
       def printable(message)
-        message.to_s.dup.force_encoding(Encoding::BINARY)
-               .encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
+        text = message.to_s
+        return text.dup if text.encoding == Encoding::UTF_8 && text.valid_encoding?
+
+        text.dup.force_encoding(Encoding::UTF_8).scrub("?")
       end
 
       # Says so rather than quietly truncating: a half-told explanation that
@@ -293,8 +300,16 @@ module WorkflowMgr
 
       # An anonymous exception class has no name, so send something the
       # caller can still make sense of rather than a null it would choke on.
+      #
+      # The message is scrubbed for the same reason log output is, and with
+      # more at stake: an error naming a path with a latin-1 byte in it
+      # carries that byte in its message, and a message JSON cannot write
+      # costs the caller the error itself -- it would be told the reply
+      # could not be encoded, in place of the Errno::ENOENT that happened.
+      # Diagnostic text is worth approximating; an error worth reporting is
+      # not worth losing over one byte of it.
       def error_response(error, prefix = "")
-        { "error" => { "class" => error.class.name.to_s, "message" => "#{prefix}#{error.message}" } }
+        { "error" => { "class" => error.class.name.to_s, "message" => "#{prefix}#{printable(error.message)}" } }
       end
 
       # Marks a reply as the last thing this actor will say. SystemExit's own
@@ -304,7 +319,7 @@ module WorkflowMgr
         message = if error.is_a?(SystemExit)
                     "the served code called exit with status #{error.status}"
                   else
-                    error.message
+                    printable(error.message)
                   end
         { "error" => { "class" => error.class.name.to_s, "message" => message }, "fatal" => true }
       end
@@ -413,6 +428,21 @@ module WorkflowMgr
 
     ##########################################
     #
+    # actor_pid
+    #
+    # The process serving this handle. Callers that have to record which
+    # process hung -- the io proxy writes it to the workflow database -- need
+    # it, and reaching into the handle for it would be worse. Named so that
+    # it is unlikely to collide with a served method; if it ever does, spawn
+    # refuses the class rather than answering the call itself.
+    #
+    ##########################################
+    def actor_pid
+      @pid
+    end
+
+    ##########################################
+    #
     # wait
     #
     # Keeps waiting for a reply that an earlier call gave up on, for up to
@@ -425,6 +455,40 @@ module WorkflowMgr
       raise ActorError, "Actor #{@klass} (pid #{@pid}) has no call waiting for a reply" if @pending.nil?
 
       await(seconds)
+    end
+
+    ##########################################
+    #
+    # discard_pending!
+    #
+    # Gives up on a reply this handle is still waiting for, so that the
+    # handle can be used again. The actor keeps running; only the answer is
+    # abandoned. Returns whether there was anything to discard.
+    #
+    # A timeout deliberately leaves the reply outstanding, since "no reply
+    # yet" is not "dead" -- but a caller who has decided the answer no
+    # longer matters would otherwise leave the handle refusing every later
+    # call with ActorBusy until somebody calls wait, and nothing in rocoto
+    # ever does. That matters most for a handle several callers share: one
+    # caller quietly swallowing a timeout would end the run for all of them,
+    # somewhere else entirely and with a message about the wrong thing.
+    #
+    # Safe because each call opens its own connection and the actor serves
+    # one at a time. The abandoned reply fails to write, which the actor
+    # treats as it treats any other failed reply, and it returns to
+    # accepting connections.
+    #
+    ##########################################
+    def discard_pending!
+      return false if @pending.nil?
+
+      begin
+        @pending[:conn].close
+      rescue SystemCallError, IOError
+        nil
+      end
+      @pending = nil
+      true
     end
 
     ##########################################

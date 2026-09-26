@@ -31,15 +31,6 @@ module WorkflowMgr
 
     ##########################################
     #
-    # ioreadlines
-    #
-    ##########################################
-    def ioreadlines(filename)
-      IO.readlines(filename, nil)[0]
-    end
-
-    ##########################################
-    #
     # exists?
     #
     ##########################################
@@ -67,36 +58,11 @@ module WorkflowMgr
 
     ##########################################
     #
-    # dirname
-    #
-    ##########################################
-    def dirname(filename)
-      File.dirname(filename)
-    end
-
-    ##########################################
-    #
     # mkdir_p
     #
     ##########################################
     def mkdir_p(dirname)
       FileUtils.mkdir_p(dirname)
-    end
-
-    ##########################################
-    #
-    # filescan
-    #
-    ##########################################
-    def grep(filename, pattern)
-      File.open(filename, 'rt') do |f|
-        f.each_line do |line|
-          if line =~ /#{pattern}/
-            return true
-          end
-        end
-      end
-      false
     end
 
     ##########################################

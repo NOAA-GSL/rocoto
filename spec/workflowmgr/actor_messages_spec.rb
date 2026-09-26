@@ -68,6 +68,20 @@ RSpec.describe 'messages from inside an actor' do
     actor&.stop!
   end
 
+  it 'keep text that is already good UTF-8 exactly as it was written' do
+    actor = WorkflowMgr::Actor.spawn(TalkativeActorTestDouble, timeout: 10)
+
+    # Approximating what JSON cannot write is one thing. A name with an
+    # accent in it is perfectly writable, and replacing each of its
+    # characters twice over makes the message harder to act on than
+    # whatever it was reporting.
+    expect(actor.log_accented_text('ok')).to eq('ok')
+
+    expect(WorkflowMgr).to have_received(:stderr).with('submitted job for task café_naïve', 1)
+  ensure
+    actor&.stop!
+  end
+
   it 'say so when there were too many to carry, rather than truncating quietly' do
     actor = WorkflowMgr::Actor.spawn(TalkativeActorTestDouble, timeout: 30)
 

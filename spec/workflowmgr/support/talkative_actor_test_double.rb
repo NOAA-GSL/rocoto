@@ -31,6 +31,13 @@ class TalkativeActorTestDouble
     result
   end
 
+  # Text that is already perfectly good UTF-8, which has no business being
+  # altered on the way back.
+  def log_accented_text(result)
+    WorkflowMgr.stderr("submitted job for task café_naïve", 1)
+    result
+  end
+
   def flood(count)
     count.times { |i| WorkflowMgr.stderr("message #{i}", 0) }
     "flooded"

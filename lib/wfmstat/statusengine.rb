@@ -111,7 +111,9 @@ module WFMStat
       end
 
       # Make sure to shut down the workflow file stat server
-      if !@workflow_io_server.nil? && @config.WorkflowIOServer
+      # Matches the condition the server was created under: in dryrun the io
+      # object lives in this process and has nothing to shut down.
+      if !@workflow_io_server.nil? && @config.WorkflowIOServer && !WorkflowMgr.dryrun_mode?
         @workflow_io_server.stop!
       end
     end
@@ -216,7 +218,9 @@ module WFMStat
       end
 
       # Make sure to shut down the workflow file stat server
-      if !@workflow_io_server.nil? && @config.WorkflowIOServer
+      # Matches the condition the server was created under: in dryrun the io
+      # object lives in this process and has nothing to shut down.
+      if !@workflow_io_server.nil? && @config.WorkflowIOServer && !WorkflowMgr.dryrun_mode?
         @workflow_io_server.stop!
       end
     end

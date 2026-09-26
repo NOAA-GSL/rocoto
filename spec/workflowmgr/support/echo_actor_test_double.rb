@@ -41,6 +41,18 @@ class EchoActorTestDouble
     "abc\xC3\x28".dup.force_encoding("UTF-8")
   end
 
+  # Fails with an error whose message holds bytes that are not valid text,
+  # the way Errno does when the path it names has a latin-1 byte in it.
+  def read_file_named_with_bad_bytes
+    File.read("/nonexistent/rocoto-actor-spec-caf\xE9")
+  end
+
+  # An object the codec has no way to carry, because it says nothing about
+  # how to rebuild itself.
+  def uncarryable
+    Object.new
+  end
+
   # A result far larger than a socket buffer, which can only be handed back
   # in pieces, as fast as the caller reads it.
   def big_payload(size)

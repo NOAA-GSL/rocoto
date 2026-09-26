@@ -120,9 +120,53 @@ RSpec.describe WorkflowMgr::Actor::Codec do
       .to raise_error(described_class::Unsupported)
   end
 
-  it 'refuses a string holding bytes that are not valid UTF-8' do
-    expect { described_class.encode("abc\xC3\x28".dup.force_encoding('UTF-8')) }
-      .to raise_error(described_class::Unsupported, /not valid UTF-8/)
+  it 'carries bytes that are not valid UTF-8, rather than refusing them' do
+    # File contents and command output are not always text. A workflow
+    # document with one latin-1 byte in it is still a workflow document, and
+    # DRb carried such bytes before actors replaced it.
+    raw = "abc\xC3\x28".dup.force_encoding('UTF-8')
+    carried = round_trip(raw)
+
+    expect(carried.bytes).to eq(raw.bytes)
+    expect(carried.encoding).to eq(raw.encoding)
+  end
+
+  it 'carries bytes in a string that claims to be ASCII but is not' do
+    # The shape this really takes: File.read tags what it returns with the
+    # default external encoding, which with no locale set is US-ASCII. A
+    # workflow document holding one latin-1 byte therefore arrives claiming
+    # to be ASCII, and trusting that claim hands JSON a string it refuses --
+    # which cost the caller the whole reply, not just the bad byte.
+    raw = "caf\xE9".dup.force_encoding(Encoding::US_ASCII)
+    carried = round_trip(raw)
+
+    expect(carried.bytes).to eq(raw.bytes)
+    expect(carried.encoding).to eq(Encoding::US_ASCII)
+  end
+
+  it 'carries a hash key that is not valid UTF-8' do
+    # JSON object keys are strings, so a key needing a tag cannot stay a
+    # key: the whole hash has to travel as pairs instead.
+    key = "k\xC3\x28".dup.force_encoding('UTF-8')
+    carried = round_trip({ key => 1 })
+
+    expect(carried.keys.first.bytes).to eq(key.bytes)
+    expect(carried.values).to eq([1])
+  end
+
+  it 'refuses a malformed bytes tag instead of failing obscurely' do
+    expect { described_class.decode({ '$' => 'Bytes', 'v' => 'not a pair' }) }
+      .to raise_error(described_class::Unsupported, /bytes arrived/)
+    expect { described_class.decode({ '$' => 'Bytes', 'v' => %w[NoSuchEncoding YWJj] }) }
+      .to raise_error(described_class::Unsupported, /could not be rebuilt/)
+  end
+
+  it 'carries binary data of its own encoding intact' do
+    raw = (0..255).map(&:chr).join.dup.force_encoding(Encoding::BINARY)
+    carried = round_trip(raw)
+
+    expect(carried.bytes).to eq(raw.bytes)
+    expect(carried.encoding).to eq(Encoding::BINARY)
   end
 
   it 'refuses a malformed hash tag instead of failing obscurely' do

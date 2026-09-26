@@ -764,9 +764,14 @@ module WorkflowMgr
       @database.transaction do |db|
         # Add or update each job in the database
         downpaths.each do |downpath|
+          # Bound rather than interpolated: these paths come from the
+          # workflow document, and a directory with an apostrophe in its
+          # name -- somebody's home directory, usually -- made this raise a
+          # syntax error, so the hang went unrecorded and the path was
+          # retried for the rest of the run.
           db.execute(
-            "INSERT INTO downpaths VALUES (NULL,'#{downpath[:path]}',#{downpath[:downtime].to_i}," \
-            "'#{downpath[:host]}',#{downpath[:pid]});"
+            "INSERT INTO downpaths VALUES (NULL,?,?,?,?);",
+            [downpath[:path], downpath[:downtime].to_i, downpath[:host], downpath[:pid]]
           )
         end
       end
@@ -790,7 +795,10 @@ module WorkflowMgr
       @database.transaction do |db|
         # Delete each downpath from the database
         downpaths.each do |downpath|
-          db.execute("DELETE FROM downpaths WHERE path='#{downpath[:path]}';")
+          # Bound for the same reason as the insert, and with more at stake
+          # here: interpolated, a path containing a quote deleted rows it was
+          # never asked to. `x' OR 1=1 --` emptied the table outright.
+          db.execute("DELETE FROM downpaths WHERE path=?;", [downpath[:path]])
         end
       end
     rescue SQLite3::BusyException

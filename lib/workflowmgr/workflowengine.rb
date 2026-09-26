@@ -1948,7 +1948,14 @@ module WorkflowMgr
                   # Roll the log file (if it already exists)
                   @workflow_io_server.roll_log(value)
                 end
-                @workflow_io_server.mkdir_p(outdir)
+                # Guarded the way the sibling site above it is: a task whose
+                # output is a bare filename leaves outdir empty, and
+                # mkdir_p("") raises Errno::ENOENT -- not a WorkflowIOHang,
+                # so it escapes the rescue below and ends the run instead of
+                # costing this one task its submission.
+                unless outdir.empty?
+                  @workflow_io_server.mkdir_p(outdir)
+                end
               end
             end
           rescue WorkflowIOHang

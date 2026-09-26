@@ -89,6 +89,19 @@ RSpec.describe WorkflowMgr::Actor do
     actor&.stop!
   end
 
+  it 'reports an error whose message holds bytes JSON cannot write, as the error it was' do
+    actor = described_class.spawn(EchoActorTestDouble, 'world', timeout: 5)
+
+    # The message travels approximated, but the error must still arrive as
+    # what happened. Losing the reply to one bad byte told the caller that
+    # its reply could not be encoded -- an error about the transport, in
+    # place of the missing file it had actually asked about.
+    expect { actor.read_file_named_with_bad_bytes }.to raise_error(Errno::ENOENT, /rocoto-actor-spec/)
+    expect(actor.greet('!')).to eq('hello world!')
+  ensure
+    actor&.stop!
+  end
+
   it 'leaves a slow actor running on timeout, so the caller can decide to keep waiting' do
     actor = described_class.spawn(EchoActorTestDouble, 'world', timeout: 1)
     pid = actor.instance_variable_get(:@pid)
@@ -99,6 +112,27 @@ RSpec.describe WorkflowMgr::Actor do
     # The same reply, still outstanding rather than lost: waiting longer
     # turns an unknown outcome back into a known one.
     expect(actor.wait(10)).to eq('awake')
+    expect(actor.greet('!')).to eq('hello world!')
+  ensure
+    actor&.stop!
+  end
+
+  it 'can give up on one outstanding reply without giving up on the actor' do
+    actor = described_class.spawn(EchoActorTestDouble, 'world', timeout: 1)
+    pid = actor.instance_variable_get(:@pid)
+    Process.kill('STOP', pid)
+
+    expect { actor.greet }.to raise_error(WorkflowMgr::Actor::ActorTimeout)
+
+    # Without this the handle refuses every later call with ActorBusy until
+    # somebody calls wait, and nothing in rocoto ever does. It matters most
+    # for a handle that several callers share: one of them quietly swallowing
+    # a timeout would end the run for all the others, somewhere else
+    # entirely and with a message about the wrong thing.
+    expect(actor.discard_pending!).to be true
+    expect(actor.discard_pending!).to be false
+
+    Process.kill('CONT', pid)
     expect(actor.greet('!')).to eq('hello world!')
   ensure
     actor&.stop!
@@ -329,13 +363,27 @@ RSpec.describe WorkflowMgr::Actor do
     expect(wait_until_dead(pid, within: 5)).to be true
   end
 
-  it 'answers with an error when a result cannot be encoded, rather than falling silent' do
+  it 'brings back a result holding bytes that are not valid UTF-8' do
     actor = described_class.spawn(EchoActorTestDouble, 'world', timeout: 5)
     pid = actor.instance_variable_get(:@pid)
 
-    expect { actor.bad_bytes }.to raise_error(WorkflowMgr::Actor::Codec::Unsupported, /not valid UTF-8/)
+    # Scheduler output and file contents are not always text; these are
+    # carried rather than refused, and byte-for-byte at that.
+    expect(actor.bad_bytes.bytes).to eq("abc\xC3\x28".dup.force_encoding('UTF-8').bytes)
 
-    # An encoding problem in one result says nothing about the actor's health.
+    expect(alive?(pid)).to be true
+    expect(actor.greet('!')).to eq('hello world!')
+  ensure
+    actor&.stop!
+  end
+
+  it 'answers with an error when a result truly cannot be carried, rather than falling silent' do
+    actor = described_class.spawn(EchoActorTestDouble, 'world', timeout: 5)
+    pid = actor.instance_variable_get(:@pid)
+
+    expect { actor.uncarryable }.to raise_error(WorkflowMgr::Actor::Codec::Unsupported, /cannot be carried/)
+
+    # One bad result says nothing about the actor's health.
     expect(alive?(pid)).to be true
     expect(actor.greet('!')).to eq('hello world!')
   ensure

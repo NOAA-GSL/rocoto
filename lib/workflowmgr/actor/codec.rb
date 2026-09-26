@@ -39,6 +39,10 @@ module WorkflowMgr
       # the whole actor down rather than failing the one call.
       MAX_DEPTH = 32
 
+      # The encodings JSON itself speaks. Held as a constant because every
+      # string that crosses to or from an actor is checked against it.
+      TEXT_ENCODINGS = [Encoding::US_ASCII, Encoding::UTF_8].freeze
+
       class Unsupported < StandardError; end
 
       class << self
@@ -100,12 +104,39 @@ module WorkflowMgr
           raise Unsupported, "#{value} cannot be carried to or from an actor: JSON has no way to write it"
         end
 
+        # Bytes JSON cannot write are carried as base64 rather than refused.
+        # File contents and command output are not always text -- a workflow
+        # document with one latin-1 byte in it is still a workflow document
+        # -- and DRb carried them before this. Base64 is faithful, not a
+        # degradation: what arrives is byte-for-byte what was sent.
         def encode_string(value)
-          return value if value.ascii_only?
-          return value if value.encoding == Encoding::UTF_8 && value.valid_encoding?
+          return value if carryable_as_text?(value)
 
-          raise Unsupported, "a #{value.encoding} string holding bytes that are not valid UTF-8 cannot be " \
-                             "carried to or from an actor"
+          tagged("Bytes", [value.encoding.name, [value].pack("m0")])
+        end
+
+        # Only encodings JSON itself speaks travel as plain text, and only
+        # when the bytes are really what they claim to be. A string in some
+        # other encoding would otherwise come back claiming to be UTF-8,
+        # which is a small lie the caller cannot see.
+        #
+        # The validity check matters as much for US-ASCII as for UTF-8, and
+        # is easier to overlook there: File.read tags what it returns with
+        # the process's default external encoding, which on a machine with
+        # no locale set is US-ASCII. A workflow document holding one latin-1
+        # byte therefore arrives claiming to be ASCII, and taking that claim
+        # at its word hands JSON a string it cannot write.
+        #
+        # US-ASCII is also the one label not preserved: a valid US-ASCII
+        # string arrives as UTF-8. Its bytes are unchanged and every
+        # US-ASCII string is valid UTF-8, so nothing can read differently
+        # for it -- while keeping the label would mean base64-ing the
+        # contents of every file read where no locale is set, which is all
+        # of them.
+        def carryable_as_text?(value)
+          return false unless value.valid_encoding?
+
+          TEXT_ENCODINGS.include?(value.encoding)
         end
 
         # A hash with nothing but string keys is carried as itself, which
@@ -114,7 +145,10 @@ module WorkflowMgr
         # list of pairs, so ordinary data can never be mistaken for a tag on
         # the way back.
         def encode_hash(hash, depth)
-          if hash.keys.all?(String) && !hash.key?(TAG)
+          # A key that cannot travel as plain text has to go the long way
+          # round: JSON object keys are strings, so a tagged one could not
+          # be a key at all.
+          if hash.keys.all? { |key| key.is_a?(String) && carryable_as_text?(key) } && !hash.key?(TAG)
             hash.transform_values { |value| encode(value, depth + 1) }
           else
             tagged("Hash", hash.map { |key, value| [encode(key, depth + 1), encode(value, depth + 1)] })
@@ -126,6 +160,7 @@ module WorkflowMgr
 
           case hash[TAG]
           when "Symbol" then hash[VALUE].to_sym
+          when "Bytes" then decode_bytes(hash[VALUE])
           when "Time" then decode_time(hash[VALUE])
           when "Hash" then decode_pairs(hash[VALUE], depth)
           else decode_object(hash[TAG], hash[VALUE], depth)
@@ -146,6 +181,22 @@ module WorkflowMgr
         # strftime, so an offset lost here shows up as the wrong hour.
         def zone_of(time)
           time.utc? ? "utc" : time.utc_offset
+        end
+
+        # Checked rather than trusted, like every other tag: what arrives
+        # here was written by another process, and a malformed payload
+        # should name itself rather than fail as a NoMethodError further on.
+        def decode_bytes(payload)
+          unless payload.is_a?(Array) && payload.size == 2 && payload.all?(String)
+            raise Unsupported, "bytes arrived in a message, but not as the encoding and data they should have been"
+          end
+
+          encoding, data = payload
+          begin
+            data.unpack1("m0").force_encoding(Encoding.find(encoding))
+          rescue ArgumentError => e
+            raise Unsupported, "bytes arrived in a message but could not be rebuilt: #{e.message}"
+          end
         end
 
         def decode_time(payload)
