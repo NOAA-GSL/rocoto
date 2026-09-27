@@ -10,6 +10,7 @@ module WFMStat
   #
   ##########################################
   class StatusEngine
+    require_relative '../../vendor/rocoto_actor/lib/rocoto_actor'
     require 'workflowmgr/workflowdoc'
     require 'workflowmgr/workflowstate'
     require 'workflowmgr/workflowdb'
@@ -54,6 +55,11 @@ module WFMStat
 
       # Get command line options
       @options = options
+
+      # The one broker for this invocation of rocoto. It owns every actor
+      # process rocoto starts, and stopping it stops all of them.
+      @broker = RocotoActor::ActorBroker.new(error_handler: WorkflowMgr.method(:report_actor_error),
+                                             on_event: WorkflowMgr.method(:report_actor_event))
 
       # Set up an object to serve the workflow database (but do not open the database)
       @db_server = WorkflowMgr.workflow_database(@config, @options)
@@ -116,6 +122,10 @@ module WFMStat
       if !@workflow_io_server.nil? && @config.WorkflowIOServer && !WorkflowMgr.dryrun_mode?
         @workflow_io_server.stop!
       end
+
+      # Last, once the things that own actors have been shut down: stopping
+      # the broker stops every actor process along with it.
+      @broker&.stop
     end
 
     ##########################################
@@ -223,6 +233,10 @@ module WFMStat
       if !@workflow_io_server.nil? && @config.WorkflowIOServer && !WorkflowMgr.dryrun_mode?
         @workflow_io_server.stop!
       end
+
+      # Last, once the things that own actors have been shut down: stopping
+      # the broker stops every actor process along with it.
+      @broker&.stop
     end
 
     ##########################################

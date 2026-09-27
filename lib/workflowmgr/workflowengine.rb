@@ -11,6 +11,7 @@ module WorkflowMgr
   ##########################################
   class WorkflowEngine
     require 'drb'
+    require_relative '../../vendor/rocoto_actor/lib/rocoto_actor'
     require 'workflowmgr/workflowconfig'
     require 'workflowmgr/workflowoption'
     require 'workflowmgr/workflowstate'
@@ -56,6 +57,11 @@ module WorkflowMgr
 
       # Get command line options
       @options = options
+
+      # The one broker for this invocation of rocoto. It owns every actor
+      # process rocoto starts, and stopping it stops all of them.
+      @broker = RocotoActor::ActorBroker.new(error_handler: WorkflowMgr.method(:report_actor_error),
+                                             on_event: WorkflowMgr.method(:report_actor_event))
 
       # Set up an object to serve the workflow database (but do not open the database)
       @db_server = WorkflowMgr.workflow_database(@config, @options)
@@ -897,6 +903,16 @@ module WorkflowMgr
         if !@workflow_io_server.nil? && @config.WorkflowIOServer && !WorkflowMgr.dryrun_mode?
           @workflow_io_server.stop!
         end
+      rescue StandardError => e
+        report_cleanup_error(e)
+      end
+
+      # Last, once the things that own actors have been shut down: stopping
+      # the broker stops every actor process along with it. Guarded like its
+      # neighbours, since an error raised here would replace the one already
+      # on its way out and skip the exit status below.
+      begin
+        @broker&.stop
       rescue StandardError => e
         report_cleanup_error(e)
       end
