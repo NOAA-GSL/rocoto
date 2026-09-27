@@ -118,12 +118,32 @@ class TransportTest < Minitest::Test
     assert_match(/non-finite/, error.message)
   end
 
-  def test_json_codec_normalizes_invalid_utf8_errors
-    error = assert_raises(RocotoActor::SerializationError) do
-      TRANSPORT.write(StringIO.new, "\xFF".b)
-    end
+  # The json gem's wording for an unencodable string differs between versions
+  # (json 2.7 says "partial character in source, but hit end"; later versions
+  # name the encodings), and the gem is whichever the host Ruby ships. The
+  # message a caller sees must therefore come from here, not from the gem.
+  def test_invalid_utf8_strings_are_rejected_with_a_gem_independent_message
+    binary = assert_raises(RocotoActor::SerializationError) { TRANSPORT.write(StringIO.new, "\xFF".b) }
+    assert_equal "string is not valid UTF-8 (ASCII-8BIT)", binary.message
 
-    assert_match(/UTF-8/, error.message)
+    tagged = assert_raises(RocotoActor::SerializationError) do
+      TRANSPORT.write(StringIO.new, "\xFF".dup.force_encoding(Encoding::UTF_8))
+    end
+    assert_equal "string is not valid UTF-8 (UTF-8)", tagged.message
+  end
+
+  # The guard above must not be stricter than the codec it stands in front of:
+  # JSON.generate transcodes these, so they have to keep working.
+  def test_strings_the_codec_accepts_are_not_rejected_by_the_guard
+    { "utf-8 multibyte" => "café", "binary ascii-only" => "abc".b,
+      "latin-1 high bytes" => "café".encode("ISO-8859-1"),
+      "us-ascii" => "abc".encode("US-ASCII") }.each do |label, value|
+      io = StringIO.new(+"".b)
+
+      TRANSPORT.write(io, value)
+
+      refute_empty io.string, label
+    end
   end
 
   # The length header is binary and a multi-byte payload is UTF-8. Concatenating

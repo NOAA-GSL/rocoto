@@ -25,10 +25,13 @@ can be violated are the most valuable output.
 - Per actor (`lib/rocoto_actor/reference.rb`): a reader thread (`read_replies`),
   a writer thread (`write_requests`), and a reaper thread (`start_reaper`,
   `actor_exited`). All share `@pending_mutex`.
-- Per broker (`lib/rocoto_actor/broker.rb`): a service thread (`run_service`:
-  route expirations and delayed tasks) and up to `max_lifecycle_workers` lifecycle
-  threads (`run_lifecycle_worker`: actor-initiated spawn/stop and relaunches).
-  All share the broker `@mutex`.
+- Per broker: a scheduler thread (`DeadlineScheduler#run`: route and boot
+  expirations, timer firing, restart backoff), an event thread
+  (`EventDispatcher#start`: `on_event` and watcher delivery), and up to
+  `max_lifecycle_workers` lifecycle threads (`LifecycleExecutor#run_worker`:
+  actor-initiated spawn/stop and relaunches). All three are created by
+  `ActorBroker#initialize` and all share the broker `@mutex` when they call
+  back into it.
 - Application threads call `spawn`, `ask`, `tell`, `stop`, `stop_actor`, and the
   query methods on `ActorBroker`.
 - Callbacks: `Future#on_resolve` blocks run on whichever thread resolves the
@@ -55,7 +58,7 @@ violations, in particular through callbacks: `on_resolve`, `on_exit`, `on_done`,
 2. `@routes` and `@responses_by_source` return to zero; no path leaks a slot.
 3. A node's boot future is settled exactly once, by exactly one of
   `spawn` (synchronous path), `spawn_child` (`on_resolve`), or the expiration, and
-   `settle_boot`/`settle_restart` are idempotent under `node.booting`.
+   `settle` is idempotent under `node.booting`.
 4. `actor_exited(node, reference)` ignores exits from a reference that is no
    longer the node's current one, and an exit during a boot is not lost
    (`node.boot_exit`).
@@ -74,11 +77,21 @@ violations, in particular through callbacks: `on_resolve`, `on_exit`, `on_done`,
    ops, wrong types, huge frames, floods) can raise on a broker thread, block
    another actor's reader, or leave broker accounting inconsistent. The reader
    thread of the offending actor may die (that actor is then treated as failed).
+10. The mirror of 9, for faults on our side: nothing may leave an actor
+   unreachable while the broker reports it healthy. Each thread serving a
+   connection (`read_replies`, `write_requests`, `start_reaper`) must, on any
+   exception it did not anticipate, reject the pending futures and stop the
+   actor rather than end quietly. A thread that dies with work queued behind it
+   leaves the node `:running` and `alive?` with `last_failure` and `last_exit`
+   nil, and every later message to that actor times out forever — the hardest
+   kind of failure to diagnose, because nothing anywhere records it. Callbacks
+   that run inside those loops (`on_done` in the writer, `on_exit` in the
+   reaper) are covered by the same rule.
 
 ## Specific interleavings worth tracing
 
 - Reader thread rejects the boot future (EOF) while the reaper thread runs
-  `actor_exited` for the same reference; then `settle_boot` runs on the
+  `actor_exited` for the same reference; then `settle` runs on the
   application thread.
 - `stop_subtrees` marks a `:restarting` node `:stopping` between `relaunch`'s
   `Launcher.launch` and its `installed` check.
@@ -92,6 +105,9 @@ violations, in particular through callbacks: `on_resolve`, `on_exit`, `on_done`,
   the reader fulfilling the same future.
 - The reaper's `@reader.join(1)` in `Reference#actor_exited` when the reader is
   itself the thread that called `kill`.
+- An exception other than `IOError`/`SystemCallError` raised inside
+  `write_requests` — from `Transport.write_payload`, or from an `on_done`
+  callback — with an ask already pending and more messages queued behind it.
 
 ## Out of scope
 

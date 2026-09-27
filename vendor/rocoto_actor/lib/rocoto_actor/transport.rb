@@ -55,7 +55,10 @@ module RocotoActor
       case value
       when nil then ["nil"]
       when true, false then ["boolean", value]
-      when String then ["string", value]
+      when String
+        raise SerializationError, "string is not valid UTF-8 (#{value.encoding})" unless encodable_string?(value)
+
+        ["string", value]
       when Integer then ["integer", value.to_s]
       when Float
         raise SerializationError, "non-finite floats are not supported" unless value.finite?
@@ -77,6 +80,18 @@ module RocotoActor
       end
     end
     private_class_method :encode
+
+    # What JSON.generate accepts: anything whose bytes are valid in its own
+    # encoding, except a binary string carrying a byte above 0x7F. Checked here
+    # rather than left to the gem, whose wording for the failure differs
+    # between versions (json 2.7 says "partial character in source", json 2.19
+    # names the encodings), which made the error the caller sees depend on
+    # which json the host Ruby happens to ship.
+    def encodable_string?(value)
+      return false unless value.valid_encoding?
+
+      value.encoding != Encoding::BINARY || value.ascii_only?
+    end
 
     def encode_container(value, seen)
       raise SerializationError, "cyclic values are not supported" if seen.key?(value)

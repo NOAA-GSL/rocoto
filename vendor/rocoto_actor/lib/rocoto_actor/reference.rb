@@ -322,8 +322,19 @@ module RocotoActor
       end
     rescue IOError, SystemCallError => error
       fail_pending(ActorStoppedError.new(error.message))
-      kill
+    rescue StandardError => error
+      # Nothing may end the writer quietly. Without this the thread dies with
+      # the outbox undrained: pending requests never resolve, later ones queue
+      # behind a thread that is gone, and the actor still reports :running and
+      # alive? with no failure recorded. read_replies guards the receiving side
+      # the same way; this is its mirror. The cause is recorded as the exit
+      # reason so last_failure explains it and the restart policy can act.
+      @pending_mutex.synchronize do
+        @exit_error ||= RemoteError.new(error.class.name, "writer failed: #{error.message}", error.backtrace)
+      end
+      fail_pending(ActorStoppedError.new("actor writer failed: #{error.message}"))
     ensure
+      kill
       discard_control_outbox
     end
 
@@ -334,7 +345,20 @@ module RocotoActor
         values
       end
       # discarded is an Array of [payload, on_done] pairs, not a Hash.
-      discarded.map(&:last).each { |on_done| on_done&.call }
+      run_teardown_callbacks(discarded.map(&:last), "discarded response callback")
+    end
+
+    # A teardown callback must not stop the rest from running: this thread is
+    # the only observer of the process's exit, so one raising callback must not
+    # strand the node (REVIEW.md invariant 10). These callbacks belong to the
+    # broker and the application, and reporting cannot go through the broker's
+    # error_handler, which is what they are already reaching into.
+    def run_teardown_callbacks(callbacks, context)
+      callbacks.each do |callback|
+        callback&.call
+      rescue StandardError => error
+        warn "rocoto_actor: #{context} raised #{error.class}: #{error.message}"
+      end
     end
 
     def read_replies
@@ -427,6 +451,16 @@ module RocotoActor
           actor_exited
         rescue Errno::ECHILD
           actor_exited
+        rescue StandardError => error
+          # waitpid failed for something other than "no such child". This thread
+          # is the only observer of the process, so record why and take the
+          # normal exit path anyway: a child that cannot be reaped is unusable,
+          # and a dead reaper would leave the node :running with nothing
+          # recorded for the broker's lifetime (REVIEW.md invariant 10).
+          @pending_mutex.synchronize do
+            @exit_error ||= RemoteError.new(error.class.name, "reaper failed: #{error.message}", error.backtrace)
+          end
+          actor_exited
         end
       end
     end
@@ -446,8 +480,9 @@ module RocotoActor
 
       pending.each { |future| future.reject(ActorStoppedError.new("actor process exited")) }
       close_socket
-      # The broker learns of the exit here; nothing above may prevent it.
-      @pending_mutex.synchronize { @exit_callbacks }.each(&:call)
+      # The broker learns of the exit here; nothing above may prevent it, and no
+      # single callback may prevent another.
+      run_teardown_callbacks(@pending_mutex.synchronize { @exit_callbacks }, "exit callback")
     end
 
     # Join re-raises whatever ended the reader; nothing here may propagate.

@@ -297,6 +297,26 @@ class RocotoActorTest < Minitest::Test
     assert_equal "killed by signal 999", RocotoActor::ExitStatus.from_reply(exitstatus: nil, termsig: 999).to_s
   end
 
+  # The reaper is the only observer of the process's exit. A callback that
+  # raises must not stop the ones after it, or the broker would never learn the
+  # actor is gone and the node would stay :running forever (invariant 10).
+  def test_a_raising_exit_callback_does_not_prevent_the_others
+    observed = Queue.new
+    @actor.on_exit { observed << :before }
+    @actor.on_exit { raise "callback fault" }
+    @actor.on_exit { observed << :after }
+
+    # stop returns once the phase reaches :exited, which the reaper broadcasts
+    # before running the callbacks, so wait for them rather than assume.
+    _out, err = capture_io do
+      assert @actor.stop(force: true, timeout: 2)
+      assert_equal %i[before after], [observed.pop(timeout: 2), observed.pop(timeout: 2)]
+    end
+
+    assert_match(/exit callback raised RuntimeError: callback fault/, err)
+    refute @actor.alive?
+  end
+
   def test_failed_spawn_is_reaped_without_a_thread_to_reap_with
     pid = Process.spawn(RbConfig.ruby, "-e", "sleep 30", pgroup: true)
 
