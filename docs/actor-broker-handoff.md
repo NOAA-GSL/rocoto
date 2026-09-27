@@ -577,6 +577,84 @@ values are rejected, check that some test also sends a good value of the same
 kind; here the encoding of every ordinary message was never exercised beyond
 ASCII.
 
+## The unhardened mirror: connection threads that ended quietly (2026-09-27)
+
+Reported from the session integrating the library into rocoto, which found two
+defects. Both are recorded here because the second is a class of bug, not an
+instance, and because the first shows how a test can assert someone else's
+wording without noticing.
+
+**The reported defect.** `Reference#write_requests` rescued only `IOError` and
+`SystemCallError`, and called `kill` inside that rescue rather than in `ensure`.
+Any other exception therefore ended the writer thread without failing the
+pending futures and without stopping the actor. The outbox then never drained:
+the in-flight request never resolved, every later message queued behind a dead
+thread and timed out, `error_handler` was never called because this is not a
+broker thread, and the node stayed `:running` and `alive?` with `last_failure`
+and `last_exit` nil. Two ways in: any non-IO exception from
+`Transport.write_payload`, and a response-completion callback (`on_done`)
+raising, since that call sits inside the same `begin`/`ensure`.
+
+This is the same symptom the multi-byte defect produced the day before, and the
+reason that one presented as a silent permanent wedge rather than a failed call.
+Fixing the encoding removed the only known trigger but left the hazard: the
+proximate cause was fixed and the mirror was not. That is the lesson worth
+keeping — when a fault reaches a thread through a path that has no catch-all,
+fixing the fault is half the work.
+
+**Why it survived several review rounds.** `read_replies` already had exactly
+this hardening — a `StandardError` catch-all that records the reason as
+`exit_error`, fails pending futures, and kills the actor. Its presence made the
+area look covered. Reviews that traced "what an actor can send" (REVIEW.md
+invariant 9) kept arriving at the reader, found it guarded, and moved on;
+nothing pointed at the sending side, where the fault is ours rather than the
+actor's.
+
+**The fix and its scope.** `write_requests` now mirrors the reader, with `kill`
+in `ensure`. Auditing the rest of invariant 10 showed the reaper had the same
+shape: `start_reaper` rescued only `Errno::ECHILD`, and `actor_exited` runs two
+sets of callbacks that can raise — a discarded response's `on_done` and the exit
+callbacks themselves, the last of which is how the broker learns the process is
+gone. An exception from either killed the only thread that observes the exit.
+The comment above that line already claimed "nothing above may prevent it",
+which the code did not enforce. Teardown callbacks are now run individually so
+one failure cannot strand the node, and the reaper takes the normal exit path
+even when `waitpid` fails for an unexpected reason, on the grounds that a child
+which cannot be reaped is unusable and a dead reaper is worse.
+
+One policy decision inside that: an `on_done` failure during *teardown* is
+reported and skipped, because the connection is already ending and the
+remaining teardown must finish; an `on_done` failure during *normal operation*
+still fails the actor, because it means the broker's own accounting is broken
+and a leaked response slot would eventually block that actor's reader anyway.
+Loud and attributable beats quietly degraded.
+
+**The smaller defect.** `test_json_codec_normalizes_invalid_utf8_errors`
+asserted that the message matched `/UTF-8/`, which is the json gem's wording,
+not ours: json 2.7 says "partial character in source, but hit end" and the test
+failed on Ruby 3.3's default gem. The gemspec declares no dependencies at all,
+so the json in use is whatever the host Ruby ships — the test was green only
+because `Gemfile.lock` pinned a newer one. `dump` did no normalization despite
+the test's name; it re-raised `error.message` verbatim.
+
+Fixed a level deeper than reported: rather than reword the rescue, the string
+check moved into `encode`, where every other rule already lives, so
+`JSON.generate` is never reached for a bad string and no gem version can
+influence the message. Choosing the predicate required measuring what
+`JSON.generate` actually accepts, which was not obvious: it rejects binary
+strings carrying a byte above 0x7F and UTF-8-tagged strings that are not valid,
+but it *accepts* ISO-8859-1 with high bytes, transcoding them. A plausible
+`valid_encoding?` check would have started rejecting those. A test now pins the
+accepted set so the guard cannot drift stricter than the codec behind it.
+
+**REVIEW.md gained invariant 10**, the application-side mirror of 9: nothing may
+leave an actor unreachable while the broker reports it healthy, and every thread
+serving a connection must fail its pending work and stop the actor rather than
+end quietly. Four method names in that document no longer existed
+(`run_service`, `run_lifecycle_worker`, `settle_boot`, `settle_restart`) and
+were corrected at the same time; a review brief that names methods a reader
+cannot find undermines the parts that are accurate.
+
 ## Immediate implementation plan
 
 ### 1. Stabilize the protocol (remaining items)
