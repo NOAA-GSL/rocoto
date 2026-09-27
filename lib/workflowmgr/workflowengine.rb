@@ -838,7 +838,7 @@ module WorkflowMgr
       Process.exit(1) unless @locked
 
       # Set up an object to serve file stat info
-      @workflow_io_server = WorkflowIOProxy.new(@db_server, @config, @options)
+      @workflow_io_server = WorkflowIOProxy.new(@db_server, @config, @options, @broker)
       ######################################
       #
       # Pass control to the code block

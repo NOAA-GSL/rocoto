@@ -32,8 +32,9 @@ module WorkflowMgr
   ##########################################
   class WorkflowIOProxy
     require 'socket'
+    require_relative '../../vendor/rocoto_actor/lib/rocoto_actor'
     require 'workflowmgr/workflowio'
-    require 'workflowmgr/actor'
+    require 'workflowmgr/io_actor'
     require 'workflowmgr/utilities'
 
     # How long to wait for a filesystem operation before calling it hung. A
@@ -47,8 +48,7 @@ module WorkflowMgr
     # must not be mistaken for one: a probe is a brand new process, so it
     # pays fork+exec and loading workflowmgr before it can stat anything at
     # all. A budget that only covers the stat declares a healthy mount dead
-    # on a loaded machine -- the same mistake that made the hang specs fail
-    # under load, with a far worse consequence here.
+    # on a loaded machine.
     PROBE_TIMEOUT = 20
 
     # How old a block must be before a retest is worth the process it costs.
@@ -65,10 +65,11 @@ module WorkflowMgr
     # initialize
     #
     ##########################################
-    def initialize(db_server, config, options)
+    def initialize(db_server, config, options, broker)
       @db_server = db_server
       @config = config
       @options = options
+      @broker = broker
       @stopped = false
 
       # Resolved once, and before anything is spawned: a sick name service
@@ -112,7 +113,7 @@ module WorkflowMgr
     ##########################################
     def stop!
       @stopped = true
-      @server.stop! if @server.respond_to?(:stop!)
+      @server.stop if actor_backed?
       @server = nil
     end
 
@@ -122,33 +123,42 @@ module WorkflowMgr
       WorkflowIO.public_instance_methods(false).include?(name)
     end
 
-    # Asked of the server itself rather than remembered, so it cannot go
-    # stale: a cached pid that outlives its process is one that gets blamed
-    # for a hang after the number has been handed to somebody else.
+    # In dryrun, or with the io server turned off, the work happens here and
+    # there is no actor to ask, stop, or blame for a hang.
+    def actor_backed?
+      !@server.nil? && !@server.is_a?(WorkflowIO)
+    end
+
+    # The io actor's process group leader -- the watchdog, which is what the
+    # broker reports and what an operator would look for to find the worker
+    # wedged underneath it. Nothing acts on this any more; it is recorded and
+    # reported for diagnosis, the ssh kill it once fed having gone.
+    #
+    # Asked of the broker rather than remembered, so it cannot go stale: a
+    # cached pid that outlives its process is one that gets blamed for a hang
+    # after the number has been handed to somebody else.
     def server_pid
-      @server.respond_to?(:actor_pid) ? @server.actor_pid : Process.pid
+      return Process.pid unless actor_backed?
+
+      actor = @broker.describe[:actors].find { |node| node[:id] == @server.id }
+      actor&.fetch(:pid, nil) || Process.pid
+    rescue StandardError
+      Process.pid
     end
 
     ##########################################
     #
     # db_quietly
     #
-    # Runs a database call whose failure must not end the run.
-    #
-    # Two separate things are needed for that, and the second is easy to
-    # miss. Rescuing stops the error escaping to callers, who rescue
-    # WorkflowIOHang and nothing else. But the database is an actor shared
-    # with the rest of rocoto, and a timed-out call leaves a reply
-    # outstanding on its handle, so every later call by anyone raises
-    # ActorBusy -- the run still ends, just later and blaming something
-    # unrelated. Discarding the reply is what actually restores it.
+    # Runs a database call whose failure must not end the run. Callers of
+    # this proxy rescue WorkflowIOHang and nothing else, so an error from the
+    # database escaping here would end the run over a filesystem note.
     #
     ##########################################
     def db_quietly
       yield
       true
     rescue StandardError => e
-      @db_server.discard_pending! if @db_server.respond_to?(:discard_pending!)
       WorkflowMgr.stderr(e.message, 2)
       WorkflowMgr.log(e.message)
       false
@@ -172,7 +182,6 @@ module WorkflowMgr
       # Losing this costs only the memory of what was wedged before, and the
       # first check to hang will record it again. Ending the run over it
       # would cost far more, and a cron-driven rocoto would keep paying it.
-      @db_server.discard_pending! if @db_server.respond_to?(:discard_pending!)
       WorkflowMgr.stderr("WARNING! rocoto could not read the list of unresponsive " \
                          "filesystems: #{e.message}", 1)
       WorkflowMgr.log(e.message)
@@ -193,8 +202,8 @@ module WorkflowMgr
     #
     ##########################################
     def start_server
-      @server = if @config.WorkflowIOServer && !WorkflowMgr.dryrun_mode?
-                  Actor.spawn(WorkflowIO, timeout: IO_TIMEOUT)
+      @server = if @config.WorkflowIOServer && !WorkflowMgr.dryrun_mode? && !@broker.nil?
+                  @broker.spawn(IOActor, name: 'io', source: io_actor_source)
                 else
                   WorkflowIO.new
                 end
@@ -202,6 +211,10 @@ module WorkflowMgr
       WorkflowMgr.stderr(e.message, 1)
       WorkflowMgr.log(e.message)
       raise "Could not launch IO server process."
+    end
+
+    def io_actor_source
+      File.expand_path('io_actor.rb', __dir__)
     end
 
     ##########################################
@@ -229,16 +242,15 @@ module WorkflowMgr
     # replace_wedged_server
     #
     # The old actor is abandoned rather than reused. It may be stuck in a
-    # syscall that will not return, so nothing waits on it; the kernel
-    # collects it if and when the filesystem recovers. This is the one place
-    # an actor is deliberately replaced, and it is safe here only because
-    # WorkflowIO holds no state worth carrying over.
+    # syscall that will not return, so stopping it may not be confirmed; the
+    # kernel collects it if and when the filesystem recovers. This is safe
+    # only because WorkflowIO holds no state worth carrying over.
     #
     ##########################################
     def replace_wedged_server
       old = @server
       @server = nil
-      old.stop! if old.respond_to?(:stop!)
+      old.stop(force: true) unless old.nil? || old.is_a?(WorkflowIO)
       start_server
     rescue StandardError => e
       WorkflowMgr.stderr(e.message, 1)
@@ -247,7 +259,26 @@ module WorkflowMgr
 
     ##########################################
     #
+    # ask_server
+    #
+    # One filesystem call, wherever the work happens.
+    #
+    ##########################################
+    def ask_server(name, args)
+      return @server.public_send(name, *args) unless actor_backed?
+
+      IOWire.decode(@server.ask(op: name, args: IOWire.encode(args)).value(timeout: IO_TIMEOUT))
+    end
+
+    ##########################################
+    #
     # forward
+    #
+    # The error taxonomy matters more than it looks. Callers rescue
+    # WorkflowIOHang and nothing else, so anything else raised here ends the
+    # run. A RemoteError is deliberately left alone: it means the filesystem
+    # answered and the answer was an error -- a missing file, say -- which is
+    # the caller's business, not a hang.
     #
     ##########################################
     def forward(name, args, path)
@@ -255,8 +286,8 @@ module WorkflowMgr
       retried = false
 
       begin
-        @server.public_send(name, *args)
-      rescue Actor::ActorTimeout
+        ask_server(name, args)
+      rescue RocotoActor::AskTimeoutError
         # Captured before anything is replaced: this identifies the process
         # that actually hung, which is what gets recorded.
         hung_pid = server_pid
@@ -269,11 +300,10 @@ module WorkflowMgr
 
         raise WorkflowIOHang, "WARNING! rocoto io process #{hung_pid} on host #{@host} " \
                               "is unresponsive while accessing #{path} and is probably wedged."
-      rescue Actor::ActorUnavailable => e
+      rescue RocotoActor::ActorStoppedError => e
+        # Covers ActorFailedError too. The process is gone rather than stuck,
+        # so nothing is blocked: a crash says nothing about the filesystem.
         if retried
-          # Same reasoning as ensure_server: callers rescue WorkflowIOHang
-          # and nothing else, and an io process that keeps dying should cost
-          # a dependency check rather than the whole run.
           raise WorkflowIOHang, "WARNING! rocoto io could not be restarted while accessing #{path}: #{e.message}"
         end
 
@@ -285,6 +315,10 @@ module WorkflowMgr
         replace_wedged_server
         ensure_server
         retry
+      rescue RocotoActor::MailboxFullError, RocotoActor::BrokerBusyError, RocotoActor::ActorRestartingError => e
+        # Back-pressure rather than a filesystem fault. Nothing is blocked
+        # and nothing is replaced; it costs this one check.
+        raise WorkflowIOHang, "WARNING! rocoto io is not accepting work while accessing #{path}: #{e.message}"
       end
     end
 
@@ -357,14 +391,19 @@ module WorkflowMgr
     # per mount per run, so a filesystem that stays down cannot accumulate
     # unkillable processes check after check.
     def answers?(target)
-      probe = Actor.spawn(WorkflowIO, timeout: PROBE_TIMEOUT)
+      # With the io server turned off there is nothing to isolate and nothing
+      # to retest with. Stating the suspect path here is precisely the hang
+      # this class exists to keep out of the main process.
+      return true unless actor_backed?
+
+      probe = @broker.spawn(IOActor, source: io_actor_source)
       begin
-        probe.exist?(target)
+        probe.ask(op: :exist?, args: [target]).value(timeout: PROBE_TIMEOUT)
         true
-      rescue Actor::ActorTimeout
+      rescue RocotoActor::AskTimeoutError
         false
       ensure
-        probe.stop!
+        probe.stop(force: true)
       end
     rescue StandardError => e
       WorkflowMgr.stderr("WARNING! rocoto could not test whether #{target} is responding: #{e.message}", 2)
@@ -400,9 +439,8 @@ module WorkflowMgr
       # A backstop rather than a live guard: refuse_blocked declines this
       # call before it ever reaches the actor when a block already covers
       # the path, and it decides that with the same test mount_for uses to
-      # choose the target. So nothing can currently arrive here twice for
-      # one target. Kept because it costs nothing and a duplicate row would
-      # outlive the run that wrote it.
+      # choose the target. Kept because it costs nothing and a duplicate row
+      # would outlive the run that wrote it.
       return if @blocks.any? { |block| block[:path] == target }
 
       block = { path: target, downtime: Time.now, host: @host, pid: server_pid }

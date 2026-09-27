@@ -83,7 +83,7 @@ module WFMStat
       @db_server.dbopen({ readonly: true })
 
       # Set up an object to serve file stat info
-      @workflow_io_server = WorkflowMgr::WorkflowIOProxy.new(@db_server, @config, @options)
+      @workflow_io_server = WorkflowMgr::WorkflowIOProxy.new(@db_server, @config, @options, @broker)
 
       # Open the workflow document
       @workflowdoc = WorkflowMgr::WorkflowXMLDoc.new(@options.workflowdoc, @workflow_io_server, @config)
@@ -196,7 +196,7 @@ module WFMStat
       @db_server.dbopen({ readonly: true })
 
       # Set up an object to serve file stat info
-      @workflow_io_server = WorkflowMgr::WorkflowIOProxy.new(@db_server, @config, @options)
+      @workflow_io_server = WorkflowMgr::WorkflowIOProxy.new(@db_server, @config, @options, @broker)
 
       # Open the workflow document
       @workflowdoc = WorkflowMgr::WorkflowXMLDoc.new(@options.workflowdoc, @workflow_io_server, @config)

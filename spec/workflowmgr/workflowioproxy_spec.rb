@@ -9,13 +9,12 @@ require 'workflowmgr/workflowioproxy'
 # Stands in for the workflow database. The proxy uses it only to remember
 # which filesystems have stopped answering.
 class FakeDownpathDB
-  attr_reader :added, :deleted, :discarded
+  attr_reader :added, :deleted
 
   def initialize(initial = [])
     @downpaths = initial
     @added = []
     @deleted = []
-    @discarded = 0
   end
 
   def load_downpaths
@@ -31,46 +30,53 @@ class FakeDownpathDB
     @deleted.concat(paths)
     paths.each { |path| @downpaths.delete(path) }
   end
-
-  # The real database is an actor, and a handle whose reply was abandoned
-  # refuses every later call until the reply is discarded.
-  def discard_pending!
-    @discarded += 1
-    true
-  end
 end
 
-# A database that cannot be written to, the way an actor that has wedged or
-# died behaves when asked.
+# A database that cannot be written to, the way an actor that has wedged
+# behaves when asked.
 class FailingWriteDB < FakeDownpathDB
   def add_downpaths(_paths)
-    raise WorkflowMgr::Actor::ActorTimeout, 'the database actor did not answer'
+    raise RocotoActor::AskTimeoutError, 'the database actor did not answer'
   end
 
   def delete_downpaths(_paths)
-    raise WorkflowMgr::Actor::ActorTimeout, 'the database actor did not answer'
+    raise RocotoActor::AskTimeoutError, 'the database actor did not answer'
   end
 end
 
 # A database that cannot even be read at startup.
 class FailingLoadDB < FakeDownpathDB
   def load_downpaths
-    raise WorkflowMgr::Actor::ActorTimeout, 'the database actor did not answer'
+    raise RocotoActor::AskTimeoutError, 'the database actor did not answer'
   end
 end
 
-# An io process that is gone as soon as it is started, which is what a node
-# out of memory looks like from here.
-class DeadIOActor
-  def actor_pid
-    -1
+# An io actor that is gone as soon as it is started, which is what a node out
+# of memory looks like from here.
+class DeadIOHandle
+  def id
+    'dead'
   end
 
-  def stop!; end
-
-  def public_send(*)
-    raise WorkflowMgr::Actor::ActorUnavailable, 'the io process died again'
+  def ask(_message)
+    raise RocotoActor::ActorFailedError, 'the io process died again'
   end
+
+  def stop(*); end
+end
+
+# An io actor whose mailbox is full: the actor system is saturated, which
+# says nothing at all about the filesystem.
+class FullMailboxHandle
+  def id
+    'full'
+  end
+
+  def ask(_message)
+    raise RocotoActor::MailboxFullError, 'mailbox is full'
+  end
+
+  def stop(*); end
 end
 
 RSpec.describe WorkflowMgr::WorkflowIOProxy do
@@ -85,35 +91,63 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
   # another host is deliberately ignored and these specs need theirs kept.
   let(:host) { Socket.getaddrinfo(Socket.gethostname, nil, nil, Socket::SOCK_STREAM)[0][3] }
 
+  # Every broker an example makes, so that every one gets stopped and no
+  # example leaves actor processes behind.
+  let(:brokers) { [] }
+
   before do
     File.write(file, "hello\n")
   end
 
   after do
+    brokers.each(&:stop)
     FileUtils.remove_entry(dir, true)
   end
 
+  def new_broker
+    RocotoActor::ActorBroker.new.tap { |broker| brokers << broker }
+  end
+
+  def build_proxy(database = db_server, configuration = config)
+    described_class.new(database, configuration, options, new_broker)
+  end
+
   # The hang specs stub IO_TIMEOUT down to a second so that a wedged call
-  # gives up quickly. That same budget is then baked into the replacement
-  # actor at spawn time, and a replacement has to fork+exec a fresh Ruby
-  # interpreter and load workflowmgr inside it -- which does not reliably
-  # finish within a second on a loaded machine. Recovery is given a real
-  # budget instead, so these specs fail when isolation is broken rather than
-  # when the machine happens to be busy.
-  #
-  # Nothing is given up by replacing explicitly here: that an actor is
-  # replaced automatically, and answers, is asserted separately below under
-  # the ordinary timeout.
+  # gives up quickly. That budget also governs the replacement actor's first
+  # call, and a replacement has to fork+exec a fresh Ruby interpreter, which
+  # does not reliably finish within a second on a loaded machine. Recovery is
+  # given a real budget instead, so these specs fail when isolation is broken
+  # rather than when the machine happens to be busy.
   def with_recovery_budget(proxy)
     stub_const("#{described_class}::IO_TIMEOUT", 30)
     proxy.send(:replace_wedged_server)
+  end
+
+  # An actor is two processes: a watchdog that owns the process group, and
+  # the worker doing the work underneath it. The broker reports the watchdog,
+  # so freezing or killing what it reports leaves the worker answering
+  # happily -- which looks exactly like the isolation being broken.
+  def io_group_pid(proxy)
+    broker = proxy.instance_variable_get(:@broker)
+    handle = proxy.instance_variable_get(:@server)
+    broker.describe[:actors].find { |node| node[:id] == handle.id }[:pid]
+  end
+
+  def io_worker_pid(proxy)
+    group = io_group_pid(proxy)
+    Dir.glob('/proc/[0-9]*/status').each do |status|
+      return Regexp.last_match(1).to_i if File.read(status)[/^PPid:\s+#{group}$/] && status =~ %r{/proc/(\d+)/}
+    rescue StandardError
+      next
+    end
+    raise "no worker process found under watchdog #{group}"
   end
 
   # Freezes the io actor so that it cannot answer, whatever we do. A real
   # D-state hang cannot be conjured here, but SIGSTOP produces the property
   # that matters.
   def freeze_io(proxy)
-    pid = proxy.instance_variable_get(:@server).actor_pid
+    pid = io_worker_pid(proxy)
     Process.kill('STOP', pid)
     pid
   end
@@ -128,7 +162,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
   end
 
   it 'answers filesystem questions from a process of its own' do
-    proxy = described_class.new(db_server, config, options)
+    proxy = build_proxy
 
     expect(proxy.exist?(file)).to be true
     expect(proxy.read(file)).to eq("hello\n")
@@ -137,12 +171,23 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
     proxy&.stop!
   end
 
+  it 'brings back a modification time as a Time' do
+    proxy = build_proxy
+
+    # It crosses as seconds, so it has to arrive as a Time again or every
+    # data dependency with an age on it silently stops working.
+    expect(proxy.mtime(file)).to be_a(Time)
+    expect(proxy.mtime(file).to_i).to eq(File.mtime(file).to_i)
+  ensure
+    proxy&.stop!
+  end
+
   it 'brings back file contents that are not valid text, byte for byte' do
     # A workflow document written in latin-1 is still a workflow document,
-    # and rocoto reads every one of them through this proxy. DRb carried
-    # such bytes, so nothing downstream expects to have to cope without them.
+    # and rocoto reads every one of them through this proxy. The transport
+    # carries only valid UTF-8, so these contents travel as bytes.
     File.binwrite(file, "<!-- caf\xE9 latin-1 -->\n")
-    proxy = described_class.new(db_server, config, options)
+    proxy = build_proxy
 
     expect(proxy.read(file).bytes).to eq(File.binread(file).bytes)
   ensure
@@ -150,7 +195,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
   end
 
   it 'does the work in this process when the io server is turned off' do
-    proxy = described_class.new(db_server, double(WorkflowIOServer: false), options)
+    proxy = build_proxy(db_server, double(WorkflowIOServer: false))
 
     expect(proxy.exist?(file)).to be true
     expect(proxy.instance_variable_get(:@server)).to be_a(WorkflowMgr::WorkflowIO)
@@ -160,7 +205,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
 
   it 'blames the filesystem rather than the directory, and keeps serving others' do
     stub_const("#{described_class}::IO_TIMEOUT", 1)
-    proxy = described_class.new(db_server, config, options)
+    proxy = build_proxy
     # Pinned rather than read from the machine, so this asserts the same
     # thing wherever it runs.
     allow(proxy).to receive(:mount_points).and_return(['/', dir])
@@ -184,7 +229,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
   end
 
   it 'refuses only what is really on the blocked filesystem, not what merely starts the same' do
-    proxy = described_class.new(db_server, config, options)
+    proxy = build_proxy
     proxy.instance_variable_set(:@blocks,
                                 [{ path: '/scratch', downtime: Time.now, host: host, pid: 1 }])
 
@@ -199,7 +244,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
 
   it 'blocks the path itself when the filesystem it lives on is the root one' do
     stub_const("#{described_class}::IO_TIMEOUT", 1)
-    proxy = described_class.new(db_server, config, options)
+    proxy = build_proxy
     allow(proxy).to receive(:mount_points).and_return(['/'])
     frozen = freeze_io(proxy)
 
@@ -207,9 +252,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
 
     # Blocking / would refuse the workflow database, the rocoto install and
     # every dependency at once. Remembering nothing instead is no better: the
-    # path is then retried by every check, for this run and every run after,
-    # each one paying IO_TIMEOUT before giving up. So the path itself is
-    # what gets remembered.
+    # path is then retried by every check, for this run and every run after.
     expect(db_server.added.map { |entry| entry[:path] }).to eq([file])
     expect(proxy.exist?('/etc/hostname')).to be true
   ensure
@@ -219,7 +262,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
 
   it 'records a relative path as itself, having no way to place it' do
     stub_const("#{described_class}::IO_TIMEOUT", 1)
-    proxy = described_class.new(db_server, config, options)
+    proxy = build_proxy
     frozen = freeze_io(proxy)
 
     # Placing it means resolving it, and resolving touches the filesystem
@@ -239,7 +282,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
   it 'retests a block that is old enough to doubt, and lifts it when the filesystem answers' do
     stale = { path: dir, downtime: Time.now - (described_class::BLOCK_TTL + 60), host: host, pid: 424_242 }
     db = FakeDownpathDB.new([stale])
-    proxy = described_class.new(db, config, options)
+    proxy = build_proxy(db)
     allow(proxy).to receive(:answers?).and_return(true)
 
     expect(proxy.exist?(file)).to be true
@@ -250,7 +293,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
 
   it 'retests a filesystem once per run, however many checks are refused' do
     stale = { path: dir, downtime: Time.now - (described_class::BLOCK_TTL + 60), host: host, pid: 424_242 }
-    proxy = described_class.new(FakeDownpathDB.new([stale]), config, options)
+    proxy = build_proxy(FakeDownpathDB.new([stale]))
     allow(proxy).to receive(:answers?).and_return(false)
 
     3.times { expect { proxy.exist?(file) }.to raise_error(WorkflowMgr::WorkflowIOHang) }
@@ -264,7 +307,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
 
   it 'does not restart the clock on a block each time a check is refused' do
     downtime = Time.now - 60
-    proxy = described_class.new(FakeDownpathDB.new, config, options)
+    proxy = build_proxy
     proxy.instance_variable_set(:@blocks, [{ path: dir, downtime: downtime, host: host, pid: 1 }])
 
     expect { proxy.exist?(file) }.to raise_error(WorkflowMgr::WorkflowIOHang)
@@ -278,7 +321,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
 
   it 'ignores a block another host recorded, which says nothing about this one' do
     elsewhere = { path: dir, downtime: Time.now, host: 'some.other.host', pid: 1 }
-    proxy = described_class.new(FakeDownpathDB.new([elsewhere]), config, options)
+    proxy = build_proxy(FakeDownpathDB.new([elsewhere]))
 
     expect(proxy.exist?(file)).to be true
   ensure
@@ -289,7 +332,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
     # Older rocotos recorded "" for a hang on a top-level path. Honouring one
     # refuses every path there is, so it is dropped on sight.
     empty = { path: '', downtime: Time.now, host: host, pid: 1 }
-    proxy = described_class.new(FakeDownpathDB.new([empty]), config, options)
+    proxy = build_proxy(FakeDownpathDB.new([empty]))
 
     expect(proxy.instance_variable_get(:@blocks)).to be_empty
     expect(proxy.exist?(file)).to be true
@@ -301,7 +344,7 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
     # Losing it costs only the memory of what was wedged before, and the
     # first check to hang records it again. Ending the run over it would cost
     # far more, and a cron-driven rocoto would keep paying it.
-    proxy = described_class.new(FailingLoadDB.new, config, options)
+    proxy = build_proxy(FailingLoadDB.new)
 
     expect(proxy.instance_variable_get(:@blocks)).to be_empty
     expect(proxy.exist?(file)).to be true
@@ -309,40 +352,36 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
     proxy&.stop!
   end
 
-  it 'repairs the shared database handle when a write to it fails' do
+  it 'survives a database that cannot record the hang it just found' do
     stub_const("#{described_class}::IO_TIMEOUT", 1)
-    db = FailingWriteDB.new
-    proxy = described_class.new(db, config, options)
+    proxy = build_proxy(FailingWriteDB.new)
     frozen = freeze_io(proxy)
 
+    # Callers rescue WorkflowIOHang and nothing else, so the database error
+    # must not be the one that comes out of here. Losing the record costs the
+    # memory of this bad mount; letting it escape would cost the run.
     expect { proxy.exist?(file) }.to raise_error(WorkflowMgr::WorkflowIOHang)
-
-    # Swallowing the error is only half of it. The database is an actor
-    # shared with the rest of rocoto, and a timed-out call leaves a reply
-    # outstanding on its handle, so every later call by anybody raises
-    # ActorBusy -- the run still ends, just later and blaming something
-    # unrelated. Discarding that reply is what actually restores it.
-    expect(db.discarded).to eq(1)
   ensure
     proxy&.stop!
     thaw(frozen)
   end
 
   it 'replaces an io process that died and answers the call anyway' do
-    proxy = described_class.new(db_server, config, options)
-    first = proxy.instance_variable_get(:@server).actor_pid
+    proxy = build_proxy
+    first_group = io_group_pid(proxy)
 
-    # Killed outright, the way an out-of-memory kill would.
-    Process.kill('KILL', first)
+    # Killed outright, the way an out-of-memory kill would. The watchdog
+    # notices and takes the whole group down with it.
+    Process.kill('KILL', io_worker_pid(proxy))
 
     expect(proxy.exist?(file)).to be true
-    expect(proxy.instance_variable_get(:@server).actor_pid).not_to eq(first)
+    expect(io_group_pid(proxy)).not_to eq(first_group)
   ensure
     proxy&.stop!
   end
 
   it 'refuses to touch the filesystem once it has been shut down' do
-    proxy = described_class.new(db_server, config, options)
+    proxy = build_proxy
     proxy.stop!
 
     # Quietly spawning a fresh actor here would leave one running with
@@ -351,12 +390,12 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
   end
 
   it 'reports an io process it cannot restart as a hang, which callers know how to survive' do
-    proxy = described_class.new(db_server, config, options)
-    Process.kill('KILL', proxy.instance_variable_get(:@server).actor_pid)
+    proxy = build_proxy
+    Process.kill('KILL', io_worker_pid(proxy))
 
     # Every caller of this proxy rescues WorkflowIOHang and nothing else, so
     # anything else escaping here ends the run -- the opposite of the point.
-    allow(WorkflowMgr::Actor).to receive(:spawn).and_raise(StandardError, 'cannot fork')
+    allow(proxy.instance_variable_get(:@broker)).to receive(:spawn).and_raise(StandardError, 'cannot fork')
 
     expect { proxy.exist?(file) }.to raise_error(WorkflowMgr::WorkflowIOHang)
   ensure
@@ -364,9 +403,9 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
   end
 
   it 'gives up as a hang when each replacement io process dies as fast as it is started' do
-    proxy = described_class.new(db_server, config, options)
-    Process.kill('KILL', proxy.instance_variable_get(:@server).actor_pid)
-    allow(WorkflowMgr::Actor).to receive(:spawn).and_return(DeadIOActor.new)
+    proxy = build_proxy
+    Process.kill('KILL', io_worker_pid(proxy))
+    allow(proxy.instance_variable_get(:@broker)).to receive(:spawn).and_return(DeadIOHandle.new)
 
     # One death earns a restart and a second try. A second is not worth
     # ending the run over either, so it costs this call and nothing more.
@@ -377,18 +416,55 @@ RSpec.describe WorkflowMgr::WorkflowIOProxy do
 
   it 'records the hang against the process that actually hung' do
     stub_const("#{described_class}::IO_TIMEOUT", 1)
-    proxy = described_class.new(db_server, config, options)
+    proxy = build_proxy
+    group = io_group_pid(proxy)
     frozen = freeze_io(proxy)
 
     expect { proxy.exist?(file) }.to raise_error(WorkflowMgr::WorkflowIOHang)
 
-    # The pid recorded is the io actor's, not rocoto's: killing rocoto
-    # instead would be a bad day.
-    expect(db_server.added.first[:pid]).to eq(frozen)
+    # What gets recorded is the io actor's own process group, not rocoto's
+    # pid: it is what an operator would look for and kill, and killing
+    # rocoto instead would be a bad day.
+    expect(db_server.added.first[:pid]).to eq(group)
     expect(db_server.added.first[:pid]).not_to eq(Process.pid)
   ensure
     proxy&.stop!
     thaw(frozen)
+  end
+
+  it 'treats back-pressure as one refused check rather than as a bad filesystem' do
+    proxy = build_proxy
+    proxy.instance_variable_set(:@server, FullMailboxHandle.new)
+
+    # A full mailbox means the actor system is saturated, not that anything
+    # is wedged, so nothing is blocked and nothing is replaced. Callers still
+    # understand only WorkflowIOHang, so that is what they get.
+    expect { proxy.exist?(file) }.to raise_error(WorkflowMgr::WorkflowIOHang, /not accepting work/)
+    expect(db_server.added).to be_empty
+  ensure
+    proxy&.stop!
+  end
+
+  it 'never stats a suspect path in this process when the io server is off' do
+    stale = { path: '/nonexistent-mount', downtime: Time.now - (described_class::BLOCK_TTL + 60),
+              host: host, pid: 1 }
+    proxy = build_proxy(FakeDownpathDB.new([stale]), double(WorkflowIOServer: false))
+
+    # With no actor there is nothing to isolate a retest, and stating the
+    # suspect path here is the very hang this class exists to keep out of the
+    # main process. The block is lifted without touching the path.
+    expect(proxy.exist?('/nonexistent-mount/x')).to be false
+  ensure
+    proxy&.stop!
+  end
+
+  describe WorkflowMgr::IOActor do
+    it 'refuses anything that is not a filesystem operation' do
+      # The proxy keeps its own list, but this is the guard that holds when a
+      # message arrives from somewhere the proxy did not build it.
+      expect { described_class.new.receive({ op: :not_a_filesystem_call, args: [] }) }
+        .to raise_error(NoMethodError, /not a filesystem operation/)
+    end
   end
 
   describe 'identifying the filesystem a path lives on' do
