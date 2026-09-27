@@ -11,7 +11,7 @@ Workflow Management is a concept that originated in the 1970's to handle busines
 ## Installation
 
 ### Requirements
-- Ruby 3.2.0 or higher (Ruby 3.0 and 3.1 are no longer supported)
+- Ruby 3.3.0 or higher (Ruby 3.2 and earlier are no longer supported)
 
 ### Quick Start
 1. Clone or download Rocoto to your desired installation directory
@@ -37,7 +37,7 @@ Available options:
 - `--local` - Install from cached gems in vendor/cache/ (air-gapped mode)
 
 The installation script will:
-1. Verify Ruby version (≥ 3.2.0)
+1. Verify Ruby version (≥ 3.3.0)
 2. Install Bundler if not already available
 3. Update script shebangs to use the specified Ruby
 4. Install all gem dependencies to `vendor/bundle`
@@ -86,10 +86,12 @@ bundle exec rspec spec/workflowmgr/cycledef_spec.rb -e "exclude_hours"
 ### Continuous Integration
 
 The project uses GitHub Actions to automatically test against multiple Ruby versions:
-- Ruby 3.2.0 (minimum supported)
-- Ruby 3.2 (latest patch)
-- Ruby 3.3.0 (first release)
+- Ruby 3.3.0 (minimum supported)
 - Ruby 3.3 (latest patch)
+- Ruby 3.4.1 (second release; 3.4.0 is excluded for a nokogiri ABI incompatibility)
+- Ruby 3.4 (latest patch)
+- Ruby 4.0.0 (first release)
+- Ruby 4.0 (latest patch)
 
 Tests run on every push and pull request.
 
