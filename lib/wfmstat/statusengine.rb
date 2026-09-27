@@ -62,7 +62,7 @@ module WFMStat
                                              on_event: WorkflowMgr.method(:report_actor_event))
 
       # Set up an object to serve the workflow database (but do not open the database)
-      @db_server = WorkflowMgr.workflow_database(@config, @options)
+      @db_server = WorkflowMgr.workflow_database(@config, @options, @broker)
     rescue StandardError => e
       WorkflowMgr.stderr(e.message, 1)
       WorkflowMgr.log(e.message)

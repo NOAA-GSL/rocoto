@@ -5,7 +5,8 @@ require 'spec_helper'
 require 'fileutils'
 require 'tmpdir'
 require 'sqlite3'
-require 'workflowmgr/actor'
+require_relative '../../vendor/rocoto_actor/lib/rocoto_actor'
+require 'workflowmgr/database_actor'
 require 'workflowmgr/workflowdb'
 
 RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
@@ -154,14 +155,17 @@ RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
       # that only shows up the first time rocotorun is run for real.
       script = <<~RUBY
         $LOAD_PATH.unshift(#{File.expand_path('../../lib', __dir__).inspect})
+        require #{File.expand_path('../../vendor/rocoto_actor/lib/rocoto_actor', __dir__).inspect}
         require "workflowmgr/workflowdb"
 
         config = Struct.new(:DatabaseType, :DatabaseServer).new("SQLite3", true)
         options = Struct.new(:database).new(#{databasefile.inspect})
 
-        database = WorkflowMgr.workflow_database(config, options)
+        broker = RocotoActor::ActorBroker.new
+        database = WorkflowMgr.workflow_database(config, options, broker)
         database.dbopen
         database.stop!
+        broker.stop
         puts "SERVED"
       RUBY
 
@@ -171,17 +175,33 @@ RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
       expect(`#{RbConfig.ruby} #{script_file} 2>&1`).to include('SERVED')
     end
 
+    # The database served from its own process, the way rocoto runs it.
+    # Rocoto's configuration exposes these exact names, so the struct has to
+    # use them whatever Ruby style guides say about method names.
+    def actor_backed_database(broker)
+      config = Struct.new(:DatabaseType, :DatabaseServer) # rubocop:disable Naming/MethodName
+                     .new('SQLite3', true)
+      options = Struct.new(:database).new(databasefile)
+      WorkflowMgr.workflow_database(config, options, broker)
+    end
+
     it 'records the pid of the rocoto process, not of the actor that writes it' do
-      actor = WorkflowMgr::Actor.spawn(described_class, databasefile, Process.pid, timeout: 20)
-      actor.dbopen
+      broker = RocotoActor::ActorBroker.new
+      database = actor_backed_database(broker)
+      database.dbopen
 
-      expect(actor.lock_workflow).to be true
+      expect(database.lock_workflow).to be true
       expect(lock_owner).to eq(Process.pid)
-      expect(lock_owner).not_to eq(actor.instance_variable_get(:@pid))
 
-      actor.unlock_workflow
+      # The lock belongs to the run. Recording the actor's pid instead would
+      # make the lock look abandoned the moment the actor was replaced.
+      actor_pid = broker.describe[:actors].first[:pid]
+      expect(actor_pid).not_to be_nil
+      expect(lock_owner).not_to eq(actor_pid)
+
+      database.unlock_workflow
     ensure
-      actor&.stop!
+      broker&.stop
     end
 
     it 'keeps the lock when its actor dies but the rocoto process holding it is still alive' do
@@ -191,11 +211,11 @@ RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
       owner = fork do
         told_actor_pid.close
         finish_now.close
-        actor = WorkflowMgr::Actor.spawn(described_class, databasefile, Process.pid, timeout: 20)
-        actor.dbopen
-        actor.lock_workflow
-        report_actor_pid.puts(actor.instance_variable_get(:@pid))
-        report_actor_pid.puts(actor.instance_variable_get(:@socket_path))
+        broker = RocotoActor::ActorBroker.new
+        database = actor_backed_database(broker)
+        database.dbopen
+        database.lock_workflow
+        report_actor_pid.puts(broker.describe[:actors].first[:pid])
         report_actor_pid.close
         may_finish.gets # stay alive, still owning the workflow
         exit!(0)
@@ -204,9 +224,7 @@ RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
       may_finish.close
 
       # The actor that took the lock is gone; the run that owns it is not.
-      actor_pid = told_actor_pid.gets.to_i
-      actor_socket = told_actor_pid.gets.chomp
-      Process.kill('KILL', actor_pid)
+      Process.kill('KILL', told_actor_pid.gets.to_i)
 
       other = described_class.new(databasefile)
       other.dbopen
@@ -220,8 +238,6 @@ RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
       expect(other.lock_workflow).to be true
       other.unlock_workflow
     ensure
-      # Killed outright, so nothing of the actor's own ran to tidy up.
-      WorkflowMgr::Actor.remove_socket(actor_socket) if actor_socket
       told_actor_pid&.close
       finish_now&.close
     end

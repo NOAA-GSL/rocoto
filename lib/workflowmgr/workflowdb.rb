@@ -34,7 +34,6 @@ module WorkflowMgr
   # Class WorkflowSQLite3DB
   #
   ##########################################
-  require 'workflowmgr/actor'
 
   # How long to wait on the database when it runs in its own process. The
   # same patience the DRb-based proxy allowed before it was replaced.
@@ -52,11 +51,17 @@ module WorkflowMgr
   # to rocoto and has to outlive any actor that happens to write it.
   #
   ##########################################
-  def self.workflow_database(config, options)
+  def self.workflow_database(config, options, broker = nil)
     database_class = const_get("Workflow#{config.DatabaseType}DB")
 
-    if config.DatabaseServer && !dryrun_mode?
-      Actor.spawn(database_class, options.database, Process.pid, timeout: DATABASE_TIMEOUT)
+    # DatabaseActor serves a WorkflowSQLite3DB by name. That is not a
+    # narrowing: SQLite3 is the only database rocoto has, and const_get above
+    # would already fail on any other DatabaseType.
+    if config.DatabaseServer && !dryrun_mode? && !broker.nil?
+      require 'workflowmgr/database_actor'
+      handle = broker.spawn(DatabaseActor, options.database, Process.pid,
+                            name: 'database', source: File.expand_path('database_actor.rb', __dir__))
+      DatabaseProxy.new(handle)
     else
       database_class.new(options.database)
     end

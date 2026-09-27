@@ -64,7 +64,7 @@ module WorkflowMgr
                                              on_event: WorkflowMgr.method(:report_actor_event))
 
       # Set up an object to serve the workflow database (but do not open the database)
-      @db_server = WorkflowMgr.workflow_database(@config, @options)
+      @db_server = WorkflowMgr.workflow_database(@config, @options, @broker)
 
       # Initialize the workflow lock
       @locked = false
