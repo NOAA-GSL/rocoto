@@ -1,7 +1,23 @@
 # frozen_string_literal: true
 
 require_relative "support/broker_test_case"
+
 class BrokerLifecycleTest < BrokerTestCase
+  # Injects a fault into the sending side. Prepended once and inert until a
+  # test sets an error; only the writer thread calls write_payload.
+  module WriterFault
+    class << self
+      attr_accessor :error
+    end
+
+    def write_payload(io, payload)
+      raise WriterFault.error if WriterFault.error
+
+      super
+    end
+  end
+  RocotoActor.const_get(:Transport).singleton_class.prepend(WriterFault)
+
   def test_spawn_records_logical_hierarchy
     workers = @broker.spawn(ExampleActor, "workers", name: "workers")
     a = @broker.spawn(ExampleActor, "a", name: :a, parent: workers)
@@ -158,6 +174,37 @@ class BrokerLifecycleTest < BrokerTestCase
 
     assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 2
     refute actor.alive?
+  end
+
+  # A writer that dies without failing its pending work leaves the actor
+  # unreachable while the broker still calls it healthy: every later message
+  # times out, nothing is recorded, and no policy can act. Any exception the
+  # send path can raise must end the actor visibly instead.
+  def test_an_unexpected_writer_fault_fails_the_actor_instead_of_wedging_it
+    actor = @broker.spawn(ExampleActor, "x", name: "x")
+    assert_equal "x: ok", actor.ask("ok").value(timeout: 2)
+
+    begin
+      WriterFault.error = RuntimeError.new("injected writer fault")
+      assert_raises(RocotoActor::ActorStoppedError) { actor.ask("after").value(timeout: 5) }
+    ensure
+      WriterFault.error = nil
+    end
+
+    wait_until(timeout: 5) { actor.state == :failed }
+    refute actor.alive?
+    assert_match(/injected writer fault/, actor.last_failure.message)
+  end
+
+  # The other way into the same place: the response-completion callback runs
+  # inside the writer loop, so a broker bug there used to kill the thread too.
+  def test_a_failing_response_callback_fails_the_actor_instead_of_wedging_it
+    @broker.stub(:release_response_slot, ->(*) { raise "injected callback fault" }) do
+      assert_raises(RocotoActor::Error) { @worker.ask("hello").value(timeout: 5) }
+    end
+
+    wait_until(timeout: 5) { @worker.state == :failed }
+    assert_match(/injected callback fault/, @worker.last_failure.message)
   end
 
   def test_describe_reports_every_actor
