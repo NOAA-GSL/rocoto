@@ -21,7 +21,7 @@ jobs:
         name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.3'
           bundler-cache: true
       -
         name: Run RuboCop
@@ -39,12 +39,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - ruby-version: '3.2.0'
-            label: '3.2.0 (minimum supported)'
-          - ruby-version: '3.2'
-            label: '3.2 (latest patch)'
           - ruby-version: '3.3.0'
-            label: '3.3.0 (first release)'
+            label: '3.3.0 (minimum supported)'
           - ruby-version: '3.3'
             label: '3.3 (latest patch)'
           - ruby-version: '3.4.1'
@@ -156,12 +152,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - ruby-version: '3.2.0'
-            label: '3.2.0 (minimum supported)'
-          - ruby-version: '3.2'
-            label: '3.2 (latest patch)'
           - ruby-version: '3.3.0'
-            label: '3.3.0 (first release)'
+            label: '3.3.0 (minimum supported)'
           - ruby-version: '3.3'
             label: '3.3 (latest patch)'
           - ruby-version: '3.4.1'
@@ -293,7 +285,7 @@ jobs:
         name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.3'
           bundler-cache: true
       -
         name: Run specs with coverage

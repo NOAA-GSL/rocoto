@@ -93,7 +93,7 @@ DEPENDENCIES
   thread (~> 0.2)
 
 RUBY VERSION
-  ruby 3.2.3p157
+  ruby 3.3.12
 
 BUNDLED WITH
   4.0.16

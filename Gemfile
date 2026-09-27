@@ -5,7 +5,7 @@ source "https://rubygems.org"
 # Ruby 3.4.0 has ABI incompatibility with nokogiri precompiled binaries.
 # Error: "undefined symbol: ruby_abi_version" when loading nokogiri C extensions.
 # Fixed in Ruby 3.4.1 (verified via testing).
-ruby ">= 3.2.0", "!= 3.4.0"
+ruby ">= 3.3.0", "!= 3.4.0"
 
 gem "nokogiri", "~> 1.19.3" # Uses precompiled libxml2 on supported platforms
 gem "open4", "~> 1.3"
