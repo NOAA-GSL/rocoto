@@ -6,8 +6,8 @@ Executed on 2026-09-22 (Ruby 3.4.10, Linux 7.0.12-linuxkit, Ubuntu 26.04 contain
 
 ```sh
 bundle exec rake                                          # lint and suite
-bundle exec ruby -Ilib test/validation/fault_matrix.rb    # fault matrix (~1 min)
-SOAK_SECONDS=1800 bundle exec ruby -Ilib test/soak/soak.rb
+bundle exec ruby -Ilib test/rocoto_actor/validation/fault_matrix.rb    # fault matrix (~1 min)
+SOAK_SECONDS=1800 bundle exec ruby -Ilib test/rocoto_actor/soak/soak.rb
 ```
 
 ## Objective
@@ -51,7 +51,7 @@ Primary implementation files:
 
 ## Results (2026-09-22, Linux)
 
-Suite: `110 runs, 412 assertions, 0 failures` with RuboCop clean, on Ruby 3.4.10 here and on Ruby 3.2, 3.3, 3.4 (Ubuntu) plus 3.4 (macOS) in CI. Fault matrix (`test/validation/fault_matrix.rb`): 30 probes, 29 passed, 1 note, no leaked threads, descriptors, children, or zombies at the end.
+Suite: `110 runs, 412 assertions, 0 failures` with RuboCop clean, on Ruby 3.4.10 here and on Ruby 3.2, 3.3, 3.4 (Ubuntu) plus 3.4 (macOS) in CI. Fault matrix (`test/rocoto_actor/validation/fault_matrix.rb`): 30 probes, 29 passed, 1 note, no leaked threads, descriptors, children, or zombies at the end.
 
 | Probe | Result | Evidence |
 |---|---|---|
@@ -203,7 +203,7 @@ The gem declares Ruby `>= 3.3`. CI runs lint and the suite on 3.3 and 3.4 on Ubu
 
 ## Completion criteria
 
-- Findings are reported before production fixes are made. (Done: recorded above and in `docs/actor-broker-handoff.md`.)
+- Findings are reported before production fixes are made. (Done: recorded above and in `actor-broker-handoff.md`.)
 - Every confirmed serious finding has a deterministic or bounded regression test. (Done.)
 - Full tests pass on the tested Linux/Ruby matrix. (Done: CI.)
 - Stress runs finish without blocked Ruby threads, zombies, or leaked actor descendants. (Done: C7 and the soak harness.)
@@ -213,7 +213,7 @@ The gem declares Ruby `>= 3.3`. CI runs lint and the suite on 3.3 and 3.4 on Ubu
 ## Suggested prompt for the container session
 
 ```text
-Read README.md and docs/linux-validation.md. Perform the fresh Linux-specific
+Read README.md and linux-validation.md. Perform the fresh Linux-specific
 adversarial review described there. Treat the implementation as untrusted.
 Run bounded tests and fault injection, but report findings before changing
 production code. Do not create a dangerous D-state fixture on shared or

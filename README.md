@@ -5,6 +5,11 @@
 ## Documentation
 Detailed documentation is provided at https://noaa-gsl.github.io/rocoto/
 
+The `rocoto_actor` library, which gives Rocoto its process-isolated actors, keeps
+its own documentation in [docs/rocoto_actor/](docs/rocoto_actor/): the
+architecture and concurrency model, the review brief, the Linux validation
+record, and the library's own README.
+
 ## Introduction
 Workflow Management is a concept that originated in the 1970's to handle business process management. Workflow management systems were developed to manage complex collections of business processes that need to be carried out in a certain way with complex interdependencies and requirements. Scientific Workflow Management is much newer, and is very much like its business counterpart, except that it is usually data oriented instead of process oriented. That is, scientific workflows are driven by the scientific data that "flows" through them. Scientific workflow tasks are usually triggered by the availability of some kind of input data, and a task's result is usually some kind of data that is fed as input to another task in the workflow. The individual tasks themselves are scientific codes that perform some kind of computation or retrieve or store some type of data for a computation. So, whereas a business workflow is comprised of a diverse set of processes that have to be completed in a certain way, sometimes carried out by a machine, sometimes carried out by a human being, a scientific workflow is usually comprised of a set of computations that are driven by the availability of input data.
 
@@ -60,7 +65,10 @@ bundle outdated
 
 ## Testing
 
-Rocoto uses RSpec for testing. The test suite can be run locally or in CI.
+Rocoto has two test suites: RSpec specs under `spec/` covering Rocoto itself,
+and a Minitest suite under `test/rocoto_actor/` covering the `rocoto_actor`
+library in `lib/rocoto_actor/`. `rake` runs both. Either can be run locally or
+in CI; see `TESTING.md` for the full picture.
 
 ### Running Tests Locally
 

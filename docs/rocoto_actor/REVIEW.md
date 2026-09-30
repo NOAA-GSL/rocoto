@@ -1,7 +1,7 @@
 # Review instructions
 
 Read this before reviewing any change in this repository. It is the review
-brief that `docs/actor-broker-handoff.md` refers to as the review focus, and
+brief that `actor-broker-handoff.md` refers to as the review focus, and
 it is read by Claude Code reviews as review-only instructions.
 
 ## What matters most
@@ -12,7 +12,7 @@ RuboCop and is out of scope. Please cite the invariant number below when a
 finding shows one can be violated.
 
 Status: the invariants were traced by the author on 2026-09-22 (see "Targeted
-concurrency read" in `docs/actor-broker-handoff.md`); an independent trace is
+concurrency read" in `actor-broker-handoff.md`); an independent trace is
 still wanted.
 
 This section directs the concurrency review. It describes the invariants the

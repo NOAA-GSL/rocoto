@@ -2,6 +2,11 @@
 
 RocotoActor runs each actor in a separate operating-system process and communicates over a Unix domain socket pair. A blocked actor therefore cannot block the application's Ruby VM.
 
+> This document describes the `rocoto_actor` library, not Rocoto itself. The
+> library was developed as a standalone gem and is now ordinary Rocoto code:
+> it lives in `lib/rocoto_actor/`, with its tests in `test/rocoto_actor/`. For
+> Rocoto, see the README at the repository root.
+
 ```ruby
 # worker.rb
 class Worker
@@ -252,7 +257,7 @@ Each actor costs two operating-system processes (the watchdog and the worker) an
 
 The preflight is an estimate, and other processes of the same user can take the headroom it measured. The broker never needs a new thread of its own after construction: its scheduler, event, and first lifecycle threads are created by `RocotoActor::ActorBroker.new`, which raises `ResourceLimitError` if they cannot be, and a second lifecycle worker that cannot be created only leaves the pool smaller. If a new actor's own threads cannot be created, that spawn or relaunch fails with `ResourceLimitError` exactly as a preflight refusal does (an actor's spawn request sees it as a `RemoteError`), and the actors already running are unaffected. A relaunch refused by the preflight or by thread creation counts against `max_restarts` like a crash; with short-lived runs that is preferable to an unbounded wait for headroom.
 
-Accepted limitations, all recorded with their evidence in `docs/linux-validation.md`: a process in uninterruptible `D` state cannot be killed until the kernel releases it (`stop` returns `false` after its grace); a subprocess that creates its own session or process group escapes containment; and process-limit exhaustion is avoided rather than survived.
+Accepted limitations, all recorded with their evidence in `linux-validation.md`: a process in uninterruptible `D` state cannot be killed until the kernel releases it (`stop` returns `false` after its grace); a subprocess that creates its own session or process group escapes containment; and process-limit exhaustion is avoided rather than survived.
 
 ## Security boundary
 
@@ -260,21 +265,28 @@ RocotoActor is a reliability bulkhead, not a sandbox for hostile code. Actor wor
 
 ## Development
 
-See [docs/architecture.md](docs/architecture.md) for the process model,
+See [architecture.md](architecture.md) for the process model,
 component responsibilities, thread ownership, and concurrency rules.
 
 ```sh
-bundle install
-bundle exec rake          # rubocop, then the test suite
-bundle exec rake test
+bundle exec rake          # both of Rocoto's suites
+bundle exec rake test     # this library's Minitest suite on its own
 bundle exec rubocop
 ```
 
-The normal suite runs in well under a minute. Two further harnesses are not part of `rake test`: a soak run of continuous traffic with injected failures that checks for leaks, and a Linux fault matrix of signal, resource-exhaustion, malformed-frame, and containment probes (results in `docs/linux-validation.md`):
+Rocoto's `rake` runs its RSpec specs and this library's Minitest suite; it does
+not run RuboCop first, as it did when this library stood alone. Install
+dependencies with `./INSTALL` from the repository root, and see `TESTING.md`
+there for the full testing picture.
+
+This library's suite takes about three minutes, because it starts and kills real
+processes. Two further harnesses are not part of `rake test`: a soak run of continuous traffic with injected failures that checks for leaks, and a Linux fault matrix of signal, resource-exhaustion, malformed-frame, and containment probes (results in `linux-validation.md`):
 
 ```sh
-SOAK_SECONDS=1800 bundle exec ruby -Ilib test/soak/soak.rb
-bundle exec ruby -Ilib test/validation/fault_matrix.rb
+SOAK_SECONDS=1800 bundle exec ruby -Ilib test/rocoto_actor/soak/soak.rb
+bundle exec ruby -Ilib test/rocoto_actor/validation/fault_matrix.rb
 ```
 
-CI runs lint and the suite on Ruby 3.3 and 3.4 on Ubuntu, plus Ruby 3.4 on macOS, and can run the soak on demand.
+In CI, the `actor-suite` job runs this library's suite on Ruby 3.3 and 3.4 under
+Ubuntu plus Ruby 3.4 under macOS; RuboCop covers the whole repository in its own
+job, and the soak runs on demand through `workflow_dispatch`.

@@ -161,8 +161,18 @@ module WorkflowMgr
             elsif Time.now - Time.at(lock[0][2]) > 300
               begin
                 WorkflowMgr.timeout(10) do
-                  system("ssh -o StrictHostKeyChecking=no #{lock[0][1]} kill -0 #{lock[0][0]} 2>&1 > /dev/null")
-                  stale = $CHILD_STATUS.exitstatus != 0
+                  # An argument list, not a command string: the host and the pid
+                  # are read back from the lock table, and a shell would treat
+                  # metacharacters in either as code. This is also the reason
+                  # the redirections moved into keyword form -- the string
+                  # version said `2>&1 > /dev/null`, which sent stderr to the
+                  # inherited stdout and only then silenced stdout.
+                  ok = system('ssh', '-o', 'StrictHostKeyChecking=no',
+                              lock[0][1].to_s, 'kill', '-0', lock[0][0].to_s,
+                              out: File::NULL, err: File::NULL)
+                  # nil means ssh itself could not be run; treat that the same
+                  # as a failed probe, exactly as the old exitstatus check did.
+                  stale = !ok
                 end
               rescue Timeout::Error
                 stale = true

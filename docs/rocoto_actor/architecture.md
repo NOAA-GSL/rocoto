@@ -168,7 +168,7 @@ handler raises, ends the thread.
    atomic under the broker mutex.
 5. Blocking socket I/O belongs only to per-actor reader or writer threads.
 
-See [REVIEW.md](../REVIEW.md) for the complete concurrency invariants and
+See [REVIEW.md](REVIEW.md) for the complete concurrency invariants and
 interleavings that reviews must preserve.
 
 ## Delivery and failure semantics
@@ -194,21 +194,27 @@ interleavings that reviews must preserve.
 | Connection and process lifecycle | `reference.rb`, `launcher.rb`, `runner.rb` |
 | Worker-to-broker protocol | `protocol.rb`, `decode_bindings.rb`, `broker_client.rb`, `transport.rb` |
 | Errors | `errors.rb` |
-| Routing tests | `test/broker_routing_test.rb` |
-| Hierarchy and shutdown tests | `test/broker_lifecycle_test.rb` |
-| Child-spawn tests | `test/broker_children_test.rb` |
-| Restart and failure tests | `test/broker_restart_test.rb` |
-| Tell tests | `test/broker_tell_test.rb` |
-| Timer tests | `test/broker_timer_test.rb` |
-| Event/watch tests | `test/broker_events_test.rb` |
+| Routing tests | `test/rocoto_actor/broker_routing_test.rb` |
+| Hierarchy and shutdown tests | `test/rocoto_actor/broker_lifecycle_test.rb` |
+| Child-spawn tests | `test/rocoto_actor/broker_children_test.rb` |
+| Restart and failure tests | `test/rocoto_actor/broker_restart_test.rb` |
+| Tell tests | `test/rocoto_actor/broker_tell_test.rb` |
+| Timer tests | `test/rocoto_actor/broker_timer_test.rb` |
+| Event/watch tests | `test/rocoto_actor/broker_events_test.rb` |
 
 ## Validation
 
-Run the normal quality gate with:
+Run the checks from the repository root. Note that `rake` here runs both of
+Rocoto's suites, and does not run RuboCop the way it did when this library
+stood alone:
 
 ```sh
-bundle exec rake
+bundle exec rake        # both suites: Rocoto's specs and this library's tests
+bundle exec rake test   # this library's Minitest suite on its own
+bundle exec rubocop
 ```
+
+`TESTING.md` at the repository root has the full testing picture.
 
 The soak and Linux fault-matrix harnesses exercise longer-running and
 platform-specific behavior. Their commands and accepted limitations are in
@@ -219,6 +225,8 @@ The chronological design, review, and validation record remains in
 why a decision was made, but this document is the starting point for the
 current architecture.
 
-To embed this library in a larger codebase, read [integration.md](integration.md):
-the child-process load-path contract, the packaging options, and what the host
-has to decide.
+This library is no longer embedded in a host: it is part of Rocoto, in
+`lib/rocoto_actor/` with its tests in `test/rocoto_actor/`. The brief that
+guided that absorption — the child-process load-path contract, the packaging
+options, and what a host has to decide — was `integration.md`. Its job is done,
+so it was not carried forward; it remains in this repository's history.

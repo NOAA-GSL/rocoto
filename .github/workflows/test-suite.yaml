@@ -36,9 +36,9 @@ jobs:
   # real actor processes and takes about three minutes.
   #
   # macOS is here deliberately: it has caught two races that Linux never did.
-  # The Ruby versions mirror the ones this suite has actually been tested on;
-  # the Docker jobs below reach further (up to 4.0), so widening this matrix to
-  # match them is a known gap, not a decision to leave it narrow forever.
+  # The Ruby matrix reaches 4.0 to match the Docker jobs below. The library's
+  # own CI only ever ran 3.3 and 3.4, so 4.0 is untested upstream: a failure
+  # there is news about the library, not about this workflow.
   actor-suite:
     name: RocotoActor Ruby ${{ matrix.ruby }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -47,7 +47,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        ruby: ['3.3', '3.4']
+        ruby: ['3.3', '3.4', '4.0']
         include:
           - os: macos-latest
             ruby: '3.4'
@@ -99,8 +99,8 @@ jobs:
         env:
           SOAK_SECONDS: ${{ github.event.inputs.soak_seconds }}
 
-  test-rocoto-amd64:
-    name: Ruby ${{ matrix.label }}
+  test-rocoto-slurm:
+    name: Slurm Ruby ${{ matrix.label }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:

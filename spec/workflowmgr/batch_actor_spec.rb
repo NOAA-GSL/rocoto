@@ -91,14 +91,14 @@ RSpec.describe 'the batch system served by an actor' do
 
     it 'submits and then hands back that submission’s answer' do
       actor = build_actor
-      actor.submit({ name: 'foo', command: '/bin/true' }, { 'A' => '1' }, ['#PBS -l x'], cycle)
+      actor.submit_parts({ name: 'foo', command: '/bin/true' }, { 'A' => '1' }, ['#PBS -l x'], cycle)
 
       expect(actor.get_submit_status('foo', cycle)).to eq(['123.sched', 'submitted'])
     end
 
     it 'answers a second time without waiting again' do
       actor = build_actor
-      actor.submit({ name: 'foo' }, {}, [], cycle)
+      actor.submit_parts({ name: 'foo' }, {}, [], cycle)
       actor.get_submit_status('foo', cycle)
 
       # The queue is emptied by the first answer, so a second wait would
@@ -112,7 +112,7 @@ RSpec.describe 'the batch system served by an actor' do
 
     it 'rebuilds the task from the three plain things a batch system reads' do
       actor = build_actor
-      actor.submit({ name: 'foo', command: '/bin/true' }, { 'START' => '2013' }, ['#PBS -l walltime=1'], cycle)
+      actor.submit_parts({ name: 'foo', command: '/bin/true' }, { 'START' => '2013' }, ['#PBS -l walltime=1'], cycle)
       actor.get_submit_status('foo', cycle)
       task = actor.instance_variable_get(:@batchsystem).submitted.first
 
@@ -126,10 +126,49 @@ RSpec.describe 'the batch system served by an actor' do
     it 'submits without a thread pool in a dryrun' do
       # Pool workers sleep waiting for work that a dryrun never produces.
       actor = build_actor([nil, 'This is a dryrun'], dryrun: true)
-      actor.submit({ name: 'foo' }, {}, [], cycle)
+      actor.submit_parts({ name: 'foo' }, {}, [], cycle)
 
       expect(actor.instance_variable_get(:@pool)).to be_nil
       expect(actor.get_submit_status('foo', cycle)).to eq([nil, 'This is a dryrun'])
+    end
+
+    # The engine holds a BatchActor directly when BatchQueueServer is false and
+    # a BatchProxy otherwise, and calls submit(task, cycle) on whichever it has.
+    # Nothing pinned that, so the two drifted: the actor kept only the wire
+    # signature, every submission on the in-process path raised ArgumentError,
+    # and the engine reported it at a verbosity the integration specs had turned
+    # off before exiting 1. The whole failure looked like an empty test run.
+    it 'takes a Task from a caller, the way the proxy does' do
+      actor = build_actor
+      task = WorkflowMgr::Task.new(0, { name: 'foo', command: '/bin/true' }, { 'A' => '1' }, :a_dependency, nil)
+      task.add_native('#PBS -l x')
+
+      actor.submit(task, cycle)
+
+      expect(actor.get_submit_status('foo', cycle)).to eq(['123.sched', 'submitted'])
+      submitted = actor.instance_variable_get(:@batchsystem).submitted.first
+      expect(submitted.attributes[:command]).to eq('/bin/true')
+      expect(submitted.envars).to eq({ 'A' => '1' })
+    end
+
+    it 'agrees with the proxy about what submit takes' do
+      # The drift above is invisible until something calls the one the engine
+      # does not hold, so compare them directly rather than trusting both.
+      expect(described_class.instance_method(:submit).arity)
+        .to eq(WorkflowMgr::BatchProxy.instance_method(:submit).arity)
+    end
+
+    it 'answers the stop! the engine cleans up with' do
+      actor = build_actor
+      task = WorkflowMgr::Task.new(0, { name: 'foo', command: '/bin/true' }, {}, nil, nil)
+      actor.submit(task, cycle)
+      actor.get_submit_status('foo', cycle)
+
+      # That ensure block calls stop! only if the object answers it. An
+      # in-process actor that does not leaves its submission pool running, with
+      # workers waiting for work that will never arrive.
+      expect(actor).to respond_to(:stop!)
+      expect { actor.stop! }.not_to raise_error
     end
   end
 
@@ -155,7 +194,7 @@ RSpec.describe 'the batch system served by an actor' do
       # The dependency trees are the part that cannot be serialised, and a
       # submission has no use for them.
       attributes, envars, natives, sent_cycle = WorkflowMgr::BatchWire.decode(handle.asked[:args])
-      expect(handle.asked[:op]).to eq(:submit)
+      expect(handle.asked[:op]).to eq(:submit_parts)
       expect(attributes[:command]).to eq('/bin/true')
       expect(envars).to eq({ 'A' => '1' })
       expect(natives).to eq(['#PBS -l x'])
