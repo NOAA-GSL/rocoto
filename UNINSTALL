@@ -16,10 +16,10 @@ rm -rf "${ROCOTO_DIR}/bundle" "${ROCOTO_DIR}/.bundle"
 
 # Reset Ruby shebangs to generic form
 echo "==> Resetting Ruby shebangs..."
-for file in sbin/rocotoboot.rb sbin/rocotocheck.rb sbin/rocotocomplete.rb \
-            sbin/rocotorewind.rb sbin/rocotorun.rb sbin/rocotostat.rb \
-            sbin/rocotovacuum.rb sbin/rocotoserver sbin/rocotoactor; do
-  if [[ -f "$file" && ! -L "$file" ]]; then
+# Selects the same files INSTALL rewrites: Ruby scripts only, so the two
+# lists cannot drift apart as scripts are added and removed.
+for file in sbin/*; do
+  if [[ -f "$file" && ! -L "$file" && "$file" != *.sh ]]; then
     sed -i.bak '1s|^#!.*|#!/usr/bin/env ruby|' "$file"
     rm -f "${file}.bak"
   fi

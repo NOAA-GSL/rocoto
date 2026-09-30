@@ -12,9 +12,6 @@ gem "open4", "~> 1.3"
 gem "sqlite3", "~> 2.0"
 gem "thread", "~> 0.2"
 
-# drb was removed from Ruby's default gems starting with 3.4.0
-gem "drb", "~> 2.2"
-
 # Legacy Ruby shim libraries for compatibility
 # TODO: These can likely be removed after refactoring parsedate usage to use Date.parse
 gem "rubysl-date", "~> 1.0"

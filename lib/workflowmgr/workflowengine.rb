@@ -10,20 +10,17 @@ module WorkflowMgr
   #
   ##########################################
   class WorkflowEngine
-    require 'drb'
     require 'securerandom'
     require_relative '../../vendor/rocoto_actor/lib/rocoto_actor'
     require 'workflowmgr/batch_actor'
     require 'workflowmgr/workflowconfig'
     require 'workflowmgr/workflowoption'
     require 'workflowmgr/workflowstate'
-    require 'workflowmgr/launchserver'
     require 'workflowmgr/workflowdoc'
     require 'workflowmgr/workflowdb'
     require 'workflowmgr/workflowioproxy'
     require 'workflowmgr/cycledef'
     require 'workflowmgr/dependency'
-    require 'workflowmgr/bqsproxy'
 
     ##########################################
     #

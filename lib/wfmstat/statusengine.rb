@@ -18,7 +18,6 @@ module WFMStat
     require "workflowmgr/cycle"
     require 'workflowmgr/dependency'
     require 'workflowmgr/workflowconfig'
-    require 'workflowmgr/launchserver'
     require 'workflowmgr/workflowioproxy'
 
     ##########################################
