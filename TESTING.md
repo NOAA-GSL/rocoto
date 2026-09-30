@@ -12,7 +12,7 @@ modules.
 
 ## Running Tests
 
-### Locally (after installation with Ruby 3.2+)
+### Locally (after installation with Ruby 3.3+)
 
 ```bash
 # Run all tests
@@ -73,7 +73,7 @@ message instead of failing. The partition/account are auto-detected via `scontro
 them with the `ROCOTO_TEST_PARTITION` / `ROCOTO_TEST_ACCOUNT` environment variables.
 
 ### In CI
-Tests run automatically on every push/PR via GitHub Actions with Ruby 3.2.0, 3.2.x, 3.3.0, and 3.3.x.
+Tests run automatically on every push/PR via GitHub Actions against every supported Ruby version: 3.3.0, 3.3, 3.4.1, 3.4, 4.0.0 and 4.0. Ruby 3.4.0 is excluded for a nokogiri ABI incompatibility.
 
 ## References
 
