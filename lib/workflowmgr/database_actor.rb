@@ -95,8 +95,8 @@ module WorkflowMgr
   class DatabaseActor
     OPERATIONS = (WorkflowSQLite3DB.public_instance_methods(false) - Object.public_instance_methods).freeze
 
-    def initialize(database_file, owner_pid)
-      @database = WorkflowSQLite3DB.new(database_file, owner_pid)
+    def initialize(database_file, owner_pid, stale_lock_timeout = 300)
+      @database = WorkflowSQLite3DB.new(database_file, owner_pid, stale_lock_timeout)
     end
 
     def receive(message)

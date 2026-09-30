@@ -26,7 +26,12 @@ module WorkflowMgr
       VacuumPurgeDays: 30,
       SubmitThreads: 8,
       JobQueueTimeout: 45,
-      JobAcctTimeout: 45
+      JobAcctTimeout: 45,
+      # How old a lock held by another host must be before this run will probe
+      # whether its owner is still alive and, if not, steal it. Only the
+      # remote-host path waits: a lock held on this host is checked at once,
+      # because the owner's pid can be looked up locally.
+      StaleLockTimeout: 300
     }.freeze
 
     ##########################################

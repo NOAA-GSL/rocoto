@@ -29,7 +29,14 @@ RSpec.describe 'Slurm integration', :slurm do
     saved_home = ENV.fetch('HOME', nil)
     ENV['HOME'] = File.join(work_dir, 'home')
     FileUtils.mkdir_p(ENV['HOME'])
-    example.run
+    # Run inside work_dir. Slurm writes its output files to the submission
+    # directory, so without this every run scatters slurm-<jobid>.out wherever
+    # rspec was invoked -- the repository root, in practice. The block form
+    # restores the directory even when the example raises, and the ensure
+    # below does the same for HOME, which a raise used to leak into later
+    # examples after `after` had deleted the directory it named.
+    Dir.chdir(work_dir) { example.run }
+  ensure
     ENV['HOME'] = saved_home
   end
 

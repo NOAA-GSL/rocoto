@@ -59,11 +59,14 @@ module WorkflowMgr
     # would already fail on any other DatabaseType.
     if config.DatabaseServer && !dryrun_mode? && !broker.nil?
       require 'workflowmgr/database_actor'
-      handle = broker.spawn(DatabaseActor, options.database, Process.pid,
+      handle = broker.spawn(DatabaseActor, options.database, Process.pid, config.StaleLockTimeout,
                             name: 'database', source: File.expand_path('database_actor.rb', __dir__))
       DatabaseProxy.new(handle)
     else
-      database_class.new(options.database)
+      # Process.pid is stated rather than left to the default, so that the
+      # timeout after it can be passed at all. It is the same value the
+      # default supplied.
+      database_class.new(options.database, Process.pid, config.StaleLockTimeout)
     end
   end
 
@@ -81,9 +84,14 @@ module WorkflowMgr
     # initialize
     #
     ##########################################
-    def initialize(database_file, owner_pid = Process.pid)
+    def initialize(database_file, owner_pid = Process.pid, stale_lock_timeout = 300)
       # Set name of database file
       @database_file = database_file
+
+      # How old another host's lock must be before we probe its owner. The
+      # default matches the value this was hardcoded to before it became
+      # configurable, so a caller that does not pass one is unchanged.
+      @stale_lock_timeout = stale_lock_timeout
 
       # Whose lock this is. Not necessarily the process running this code:
       # when the database runs as an actor, the workflow belongs to the
@@ -141,7 +149,10 @@ module WorkflowMgr
 
           # If no lock is present, we have acquired the lock.  Write the WFM's pid and host into the lock table
           if lock.empty?
-            db.execute("INSERT INTO lock VALUES (#{@owner_pid},'#{Socket.getaddrinfo(Socket.gethostname, nil, nil, Socket::SOCK_STREAM)[0][3]}',#{Time.now.to_i});")
+            db.execute("INSERT INTO lock VALUES (?,?,?);",
+                       [@owner_pid,
+                        Socket.getaddrinfo(Socket.gethostname, nil, nil, Socket::SOCK_STREAM)[0][3],
+                        Time.now.to_i])
 
           # Otherwise, we didn't get the lock, but we need to check to make sure the lock is not stale
           else
@@ -157,8 +168,9 @@ module WorkflowMgr
                 stale = true
               end
 
-            # Otherwise do a kill -0 through an ssh tunnel if the lock is 5 minutes old ## BUG, make this configurable
-            elsif Time.now - Time.at(lock[0][2]) > 300
+            # Otherwise probe the owner over ssh, but only once the lock is old
+            # enough to be worth suspecting. StaleLockTimeout in rocotorc.
+            elsif Time.now - Time.at(lock[0][2]) > @stale_lock_timeout
               begin
                 WorkflowMgr.timeout(10) do
                   # An argument list, not a command string: the host and the pid
@@ -184,7 +196,8 @@ module WorkflowMgr
             lockhostinfo = Socket.getaddrinfo(lock[0][1], nil)[0]
             if stale
               db.execute("DELETE FROM lock;")
-              db.execute("INSERT INTO lock VALUES (#{@owner_pid},'#{localhostinfo[3]}',#{Time.now.to_i});")
+              db.execute("INSERT INTO lock VALUES (?,?,?);",
+                         [@owner_pid, localhostinfo[3], Time.now.to_i])
               msg = "WARNING: Rocoto pid #{@owner_pid} on host #{localhostinfo[2]} (#{localhostinfo[3]}) " \
                     "stole stale lock from Rocoto pid #{lock[0][0]} on host " \
                     "#{lockhostinfo[2]} (#{lockhostinfo[3]})."
@@ -204,7 +217,11 @@ module WorkflowMgr
         open_workflow_db
         true
       rescue WorkflowMgr::WorkflowLockedException
-        WorkflowMgr.stderr($ERROR_INFO.to_s, 3)
+        # Level 1, not 3: returning false here is what makes the run exit
+        # non-zero, and default verbosity is 1. At level 3 this explanation
+        # reached the log file and nothing else, so a cron user got a failed
+        # run and an empty mail body with no way to tell why.
+        WorkflowMgr.stderr($ERROR_INFO.to_s, 1)
         WorkflowMgr.log($ERROR_INFO.to_s)
         false
       rescue SQLite3::BusyException

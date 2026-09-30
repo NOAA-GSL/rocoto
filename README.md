@@ -45,7 +45,7 @@ The installation script will:
 1. Verify Ruby version (≥ 3.3.0)
 2. Install Bundler if not already available
 3. Update script shebangs to use the specified Ruby
-4. Install all gem dependencies to `vendor/bundle`
+4. Install all gem dependencies to `bundle/` (set by `.bundle/config`)
 
 ### Managing Dependencies
 

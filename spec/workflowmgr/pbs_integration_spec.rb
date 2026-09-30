@@ -24,7 +24,14 @@ RSpec.describe 'PBS Professional integration', :pbs do
     saved_home = ENV.fetch('HOME', nil)
     ENV['HOME'] = File.join(work_dir, 'home')
     FileUtils.mkdir_p(ENV['HOME'])
-    example.run
+    # Run inside work_dir. PBS writes its spool files to the submission
+    # directory, so without this every run scatters <jobid>.pbsserver.OU and
+    # .ER wherever rspec was invoked -- the repository root, in practice.
+    # The block form restores the directory even when the example raises, and
+    # the ensure below does the same for HOME, which a raise used to leak
+    # into later examples after `after` had deleted the directory it named.
+    Dir.chdir(work_dir) { example.run }
+  ensure
     ENV['HOME'] = saved_home
   end
 

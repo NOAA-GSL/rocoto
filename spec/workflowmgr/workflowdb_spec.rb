@@ -103,6 +103,88 @@ RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
       expect(WorkflowMgr).to have_received(:stderr).with(/no workflow lock to release/, 1)
     end
 
+    # Write a lock row directly, so a held lock can be set up without a second
+    # process. A numeric TEST-NET address stands in for another host: the code
+    # calls getaddrinfo on whatever it finds here, and a numeric address
+    # resolves without DNS or a timeout.
+    def hold_lock(pid:, host:, age_seconds:)
+      db = SQLite3::Database.new(lockfile)
+      db.execute('INSERT INTO lock VALUES (?,?,?);', [pid, host, Time.now.to_i - age_seconds])
+    ensure
+      db&.close
+    end
+
+    def local_ip
+      Socket.getaddrinfo(Socket.gethostname, nil, nil, Socket::SOCK_STREAM)[0][3]
+    end
+
+    it 'says why, at ordinary verbosity, when another run holds the lock' do
+      # Returning false here is what makes the run exit non-zero. Reported
+      # above the default verbosity, as it was, the explanation reached the
+      # log file alone and a cron user got a failure with an empty mail body.
+      allow(WorkflowMgr).to receive(:stderr)
+      allow(WorkflowMgr).to receive(:log)
+
+      database = described_class.new(databasefile, 424_242)
+      database.dbopen
+      # This process is alive, so its lock is not stale.
+      hold_lock(pid: Process.pid, host: local_ip, age_seconds: 0)
+
+      expect(database.lock_workflow).to be false
+      expect(WorkflowMgr).to have_received(:stderr).with(/Workflow is locked by pid/, 1)
+    end
+
+    it 'steals a lock from another host once its owner is gone' do
+      database = described_class.new(databasefile, 424_242, 1)
+      database.dbopen
+      hold_lock(pid: 999_999, host: '203.0.113.1', age_seconds: 3600)
+      # A non-zero ssh probe means the owner is no longer running.
+      allow(database).to receive(:system).and_return(false)
+
+      expect(database.lock_workflow).to be true
+      expect(lock_owner).to eq(424_242)
+    end
+
+    it 'probes the remote owner with an argument list, never a shell string' do
+      # The host and pid come out of the lock table. Built into one string
+      # they would be interpreted by a shell, so the call has to stay a list.
+      database = described_class.new(databasefile, 424_242, 1)
+      database.dbopen
+      hold_lock(pid: 999_999, host: '203.0.113.1', age_seconds: 3600)
+      allow(database).to receive(:system).and_return(false)
+
+      database.lock_workflow
+
+      expect(database).to have_received(:system)
+        .with('ssh', '-o', 'StrictHostKeyChecking=no', '203.0.113.1', 'kill', '-0', '999999',
+              hash_including(:out, :err))
+    end
+
+    it 'leaves a lock alone while its remote owner still answers' do
+      database = described_class.new(databasefile, 424_242, 1)
+      database.dbopen
+      hold_lock(pid: 999_999, host: '203.0.113.1', age_seconds: 3600)
+      # A zero exit means the owner is still running.
+      allow(database).to receive(:system).and_return(true)
+
+      expect(database.lock_workflow).to be false
+      expect(lock_owner).to eq(999_999)
+    end
+
+    it 'waits StaleLockTimeout before suspecting a remote lock at all' do
+      # The age is chosen to sit between the configured timeout and the 300
+      # seconds this used to be hardcoded to. Anything below both would be
+      # left alone either way, and the example would pass whether or not the
+      # setting is consulted at all.
+      database = described_class.new(databasefile, 424_242, 3600)
+      database.dbopen
+      hold_lock(pid: 999_999, host: '203.0.113.1', age_seconds: 600)
+      allow(database).to receive(:system).and_return(false)
+
+      expect(database.lock_workflow).to be false
+      expect(database).not_to have_received(:system)
+    end
+
     it 'does not retry taking the lock, since a retry reads our own row as someone else\'s' do
       # Every other database call is retried when SQLite reports the file
       # busy. Taking the lock must not be: by the time it can fail, its row
@@ -158,7 +240,7 @@ RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
         require "rocoto_actor"
         require "workflowmgr/workflowdb"
 
-        config = Struct.new(:DatabaseType, :DatabaseServer).new("SQLite3", true)
+        config = Struct.new(:DatabaseType, :DatabaseServer, :StaleLockTimeout).new("SQLite3", true, 300)
         options = Struct.new(:database).new(#{databasefile.inspect})
 
         broker = RocotoActor::ActorBroker.new
@@ -179,8 +261,8 @@ RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
     # Rocoto's configuration exposes these exact names, so the struct has to
     # use them whatever Ruby style guides say about method names.
     def actor_backed_database(broker)
-      config = Struct.new(:DatabaseType, :DatabaseServer) # rubocop:disable Naming/MethodName
-                     .new('SQLite3', true)
+      config = Struct.new(:DatabaseType, :DatabaseServer, :StaleLockTimeout) # rubocop:disable Naming/MethodName
+                     .new('SQLite3', true, 300)
       options = Struct.new(:database).new(databasefile)
       WorkflowMgr.workflow_database(config, options, broker)
     end
