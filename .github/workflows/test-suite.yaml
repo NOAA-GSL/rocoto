@@ -27,6 +27,40 @@ jobs:
         name: Run RuboCop
         run: bundle exec rubocop --format github
 
+  # rocoto_actor's own suite needs no scheduler and no container, so it runs
+  # directly rather than as a step inside the Docker matrix below. It spawns
+  # real actor processes and takes about three minutes.
+  #
+  # macOS is here deliberately: it has caught two races that Linux never did.
+  # The Ruby versions mirror the ones this suite has actually been tested on;
+  # the Docker jobs below reach further (up to 4.0), so widening this matrix to
+  # match them is a known gap, not a decision to leave it narrow forever.
+  actor-suite:
+    name: RocotoActor Ruby ${{ matrix.ruby }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        ruby: ['3.3', '3.4']
+        include:
+          - os: macos-latest
+            ruby: '3.4'
+    steps:
+      -
+        name: Checkout repository
+        uses: actions/checkout@v4
+      -
+        name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      -
+        name: Run the rocoto_actor Minitest suite
+        run: bundle exec rake test
+
   test-rocoto-amd64:
     name: Ruby ${{ matrix.label }}
     runs-on: ubuntu-latest

@@ -67,8 +67,15 @@ Rocoto uses RSpec for testing. The test suite can be run locally or in CI.
 After installation, run the test suite:
 
 ```bash
+# Run everything: the RSpec specs and the rocoto_actor Minitest suite
+bundle exec rake
+
 # Run all specs
 bundle exec rake spec
+
+# Run the rocoto_actor suite on its own. It spawns real actor processes and
+# takes about three minutes, so rake spec is the faster loop for Rocoto work.
+bundle exec rake test
 
 # Run specs with coverage report
 bundle exec rake coverage
@@ -81,17 +88,27 @@ bundle exec rspec spec/workflowmgr/cycledef_spec.rb
 
 # Run specs matching a pattern
 bundle exec rspec spec/workflowmgr/cycledef_spec.rb -e "exclude_hours"
+
+# Run a single rocoto_actor test file
+bundle exec rake test TEST=test/rocoto_actor/broker_restart_test.rb
 ```
 
 ### Continuous Integration
 
-The project uses GitHub Actions to automatically test against multiple Ruby versions:
+The project uses GitHub Actions. The Rocoto specs run inside Slurm and PBS
+containers against every supported Ruby version:
 - Ruby 3.3.0 (minimum supported)
 - Ruby 3.3 (latest patch)
 - Ruby 3.4.1 (second release; 3.4.0 is excluded for a nokogiri ABI incompatibility)
 - Ruby 3.4 (latest patch)
 - Ruby 4.0.0 (first release)
 - Ruby 4.0 (latest patch)
+
+The `rocoto_actor` suite runs as its own job, without a container or a
+scheduler, on Ruby 3.3 and 3.4 under Linux and on Ruby 3.4 under macOS. macOS
+is included because it has caught process races that Linux did not. That
+matrix is narrower than the one above, which is a known gap rather than a
+decision to keep it narrow.
 
 Tests run on every push and pull request.
 
