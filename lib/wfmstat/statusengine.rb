@@ -10,7 +10,7 @@ module WFMStat
   #
   ##########################################
   class StatusEngine
-    require_relative '../../vendor/rocoto_actor/lib/rocoto_actor'
+    require 'rocoto_actor'
     require 'workflowmgr/workflowdoc'
     require 'workflowmgr/workflowstate'
     require 'workflowmgr/workflowdb'

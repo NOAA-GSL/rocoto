@@ -5,7 +5,7 @@ require 'spec_helper'
 require 'fileutils'
 require 'tmpdir'
 require 'sqlite3'
-require_relative '../../vendor/rocoto_actor/lib/rocoto_actor'
+require 'rocoto_actor'
 require 'workflowmgr/database_actor'
 require 'workflowmgr/workflowdb'
 
@@ -155,7 +155,7 @@ RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
       # that only shows up the first time rocotorun is run for real.
       script = <<~RUBY
         $LOAD_PATH.unshift(#{File.expand_path('../../lib', __dir__).inspect})
-        require #{File.expand_path('../../vendor/rocoto_actor/lib/rocoto_actor', __dir__).inspect}
+        require "rocoto_actor"
         require "workflowmgr/workflowdb"
 
         config = Struct.new(:DatabaseType, :DatabaseServer).new("SQLite3", true)

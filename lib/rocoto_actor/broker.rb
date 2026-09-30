@@ -198,7 +198,7 @@ module RocotoActor
     def roots
       @mutex.synchronize do
         @nodes.values.select { |node| node.parent_id.nil? && !node.terminal? }
-              .map { |node| ActorHandle.new(node.id, broker: self) }
+                     .map { |node| ActorHandle.new(node.id, broker: self) }
       end
     end
 

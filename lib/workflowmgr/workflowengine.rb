@@ -11,7 +11,7 @@ module WorkflowMgr
   ##########################################
   class WorkflowEngine
     require 'securerandom'
-    require_relative '../../vendor/rocoto_actor/lib/rocoto_actor'
+    require 'rocoto_actor'
     require 'workflowmgr/batch_actor'
     require 'workflowmgr/workflowconfig'
     require 'workflowmgr/workflowoption'

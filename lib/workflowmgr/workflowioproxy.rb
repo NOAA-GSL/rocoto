@@ -32,7 +32,7 @@ module WorkflowMgr
   ##########################################
   class WorkflowIOProxy
     require 'socket'
-    require_relative '../../vendor/rocoto_actor/lib/rocoto_actor'
+    require 'rocoto_actor'
     require 'workflowmgr/workflowio'
     require 'workflowmgr/io_actor'
     require 'workflowmgr/utilities'
