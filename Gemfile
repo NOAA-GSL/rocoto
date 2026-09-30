@@ -18,6 +18,10 @@ gem "rubysl-date", "~> 1.0"
 gem "rubysl-parsedate", "~> 1.0"
 
 group :development, :test do
+  # rocoto_actor keeps its own Minitest suite under test/rocoto_actor/; see
+  # the Rakefile. minitest is a bundled gem, so it has to be declared here
+  # or `require "minitest/autorun"` fails under Bundler.
+  gem "minitest", "~> 5.0"
   gem "rake", "~> 13.0"
   gem "rspec", "~> 3.13"
 end

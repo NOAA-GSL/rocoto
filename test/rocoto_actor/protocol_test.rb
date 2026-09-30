@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
-require_relative "../lib/rocoto_actor"
+require "rocoto_actor"
 
 class ProtocolTest < Minitest::Test
   PROTOCOL = RocotoActor.const_get(:Protocol)

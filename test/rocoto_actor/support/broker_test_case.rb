@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
-require_relative "../../lib/rocoto_actor"
+require "rocoto_actor"
 require_relative "example_actor"
 require_relative "process_actor"
 require_relative "supervisor_actor"

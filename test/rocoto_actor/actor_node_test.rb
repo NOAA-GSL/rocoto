@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
-require_relative "../lib/rocoto_actor"
+require "rocoto_actor"
 
 class ActorNodeTest < Minitest::Test
   ACTOR_NODE = RocotoActor.const_get(:ActorNode)

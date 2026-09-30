@@ -5,7 +5,7 @@
 #
 #   ruby -Ilib test/validation/app_child.rb idle|busy|descendants
 
-require_relative "../../lib/rocoto_actor"
+require "rocoto_actor"
 require_relative "../support/example_actor"
 require_relative "support"
 require "json"

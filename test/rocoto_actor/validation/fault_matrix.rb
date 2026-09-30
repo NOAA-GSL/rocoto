@@ -9,7 +9,7 @@
 # Every probe has a hard time limit and stops its own broker; a probe that hangs
 # is reported as a failure rather than hanging the run.
 
-require_relative "../../lib/rocoto_actor"
+require "rocoto_actor"
 require_relative "../support/example_actor"
 require_relative "../support/process_actor"
 require_relative "support"

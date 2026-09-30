@@ -9,7 +9,7 @@
 # Exits non-zero when a resource trends upward, a zombie persists, a child
 # process outlives the broker, or an unexpected error class is observed.
 
-require_relative "../../lib/rocoto_actor"
+require "rocoto_actor"
 require_relative "../support/example_actor"
 require_relative "../support/process_actor"
 require_relative "../support/supervisor_actor"

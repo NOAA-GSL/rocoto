@@ -3,7 +3,7 @@
 require "minitest/autorun"
 require "stringio"
 require "socket"
-require_relative "../lib/rocoto_actor"
+require "rocoto_actor"
 
 class TransportTest < Minitest::Test
   TRANSPORT = RocotoActor.const_get(:Transport) # internal; exercised directly here

@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
-require_relative "../lib/rocoto_actor"
+require "rocoto_actor"
 
 class FutureTest < Minitest::Test
   def test_a_callback_registered_after_resolution_is_guarded_too
