@@ -189,6 +189,19 @@ module WorkflowMgr
 
     ##########################################
     #
+    # scheduler_name
+    #
+    # The scheduler as the document names it. A batch system object cannot
+    # cross to the process that serves it, so what travels is this name and
+    # the two timeouts its constructor reads.
+    #
+    ##########################################
+    def scheduler_name
+      @workflowdoc.root["scheduler"]
+    end
+
+    ##########################################
+    #
     # features_supported?
     #
     ##########################################

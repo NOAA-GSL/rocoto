@@ -1,0 +1,77 @@
+<?xml version="1.0"?> 
+<!DOCTYPE workflow
+[
+ <!ENTITY CYCLE_TIME "@Y@m@d@H">
+ <!ENTITY SJET "-l partition=sjet">
+ <!ENTITY HJET "-l partition=hjet">
+ <!ENTITY RESERVATION_ID "fimens">
+ <!ENTITY RESERVATION "<cyclestr>-l flags=ADVRES:&RESERVATION_ID;-@Hz</cyclestr>">
+ <!ENTITY CUSTOM "<native></native>">
+
+
+ <!ENTITY TEST_HOME "/home/admin/rocoto/test">
+ <!ENTITY DATA_HOME "/home/admin/rocoto/test">
+ <!ENTITY QUEUE "compute">
+ <!ENTITY SCHED "pbspro">
+
+
+]>
+
+<workflow realtime="f" scheduler="&SCHED;" cyclelifespan="0:01:00:00" cyclethrottle="5" corethrottle="100" taskthrottle="10">
+
+  <log verbosity="10">&TEST_HOME;/log/workflow/<cyclestr>workflow_@Y@m@d@H@M.log</cyclestr></log>
+<!--
+  <cycledef group="group1">201101010000 201201010000 1:00:00:00</cycledef>
+  <cycledef group="group1">201201010000 201301010000 01:00:00</cycledef>
+-->
+  <cycledef group="group1">201301010000 201401010000 01:00:00</cycledef>
+
+  <metatask name="foo" mode="serial">
+
+    <var name="foo">1 2 3 4 5 6 7 8 9 10</var>
+
+    <task name="foo_#foo#" maxtries="3" cycledefs="group1">
+
+
+      &CUSTOM;
+
+      <command><cyclestr offset="-1:00:00">&TEST_HOME;/bin/test.ksh -d @Y-@m-@d_@X @p</cyclestr></command>
+
+      <!--
+      <QUEUE>&QUEUE;</QUEUE>
+      -->
+      <nodes>1:ppn=1</nodes>
+
+      <walltime> 01:10 </walltime>
+
+      <join>&TEST_HOME;/log/test/test_#foo#.join</join>
+
+      <jobname>test#foo#</jobname>
+<!--
+      <deadline><cyclestr offset="00:30:00">@Y@m@d@H@M@S</cyclestr></deadline>
+-->
+      <envar>
+        <name>START_TIME</name><value><cyclestr>@Y@m@d@H</cyclestr></value>
+      </envar>
+      <envar>
+        <name>FORMAT</name><value><cyclestr>%Y%m%d%H</cyclestr></value>
+      </envar>
+
+      <dependency>
+        <some threshold="0.5">
+          <datadep minsize="1B">&DATA_HOME;/test1.dat</datadep>
+          <datadep minsize="1b">&DATA_HOME;/test2.dat</datadep>
+          <datadep>&DATA_HOME;/test3.dat</datadep>
+        </some>
+      </dependency>
+<!--
+      <hangdependency>
+        <datadep age="30">&DATA_HOME;/test4.dat</datadep>
+      </hangdependency>
+-->
+    </task>
+
+  </metatask>
+
+
+</workflow>

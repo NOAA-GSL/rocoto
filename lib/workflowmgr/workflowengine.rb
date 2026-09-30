@@ -11,7 +11,9 @@ module WorkflowMgr
   ##########################################
   class WorkflowEngine
     require 'drb'
+    require 'securerandom'
     require_relative '../../vendor/rocoto_actor/lib/rocoto_actor'
+    require 'workflowmgr/batch_actor'
     require 'workflowmgr/workflowconfig'
     require 'workflowmgr/workflowoption'
     require 'workflowmgr/workflowstate'
@@ -483,13 +485,11 @@ module WorkflowMgr
               end
             end
 
-            # Initialize jobid of the new job
-            # In dryrun mode, no DRb server is launched, so use 0 as placeholder
-            newjobid = if @config.BatchQueueServer && !WorkflowMgr.dryrun_mode?
-                         @bq_server.__drburi
-                       else
-                         0
-                       end
+            # A marker standing in for the jobid until the scheduler gives us
+            # a real one. Its purpose is to leave evidence: a row in this
+            # state is a submission that was started and never confirmed, and
+            # it is unique so that the submission can be identified later.
+            newjobid = SecureRandom.uuid
 
             # Create the job
             job = Job.new(newjobid,                            # jobid
@@ -542,14 +542,6 @@ module WorkflowMgr
             unless WorkflowMgr.dryrun_mode?
               @log_server.log(boot_cycle_time,
                               "Forcibly submitting #{task.attributes[:name]}")
-            end
-
-            # If we are not using a batch queue server, shut down the pool, which blocks until
-            # this submission finishes running, before checking for job ids. submit() recreates
-            # the pool on the next iteration.
-            # Skip in dryrun mode - thread pool workers sleep indefinitely waiting for work and cause deadlock
-            unless @config.BatchQueueServer || WorkflowMgr.dryrun_mode?
-              @bq_server.shutdown
             end
 
             # Harvest job ids for submitted tasks
@@ -861,14 +853,11 @@ module WorkflowMgr
       # raised on the way out would replace the one that ended the run.
       unlock_failed = false
 
-      # Shut down the batch queue server if it is no longer needed
-      # Skip if in dryrun mode since no server was launched
+      # Shut down the batch queue server. It no longer outlives the run, so
+      # there is nothing to decide and nothing to record: every submission
+      # this run started has already been waited for.
       begin
-        if !(@bq_server.nil? || !@config.BatchQueueServer || WorkflowMgr.dryrun_mode?) && !@bq_server.running?
-          uri = @bq_server.__drburi
-          @bq_server.stop!
-          @db_server.delete_bqservers([uri])
-        end
+        @bq_server.stop! if @bq_server.respond_to?(:stop!)
       rescue StandardError => e
         report_cleanup_error(e)
       end
@@ -973,11 +962,21 @@ module WorkflowMgr
       # Get the metatask taskthrottles
       @metatask_throttles = workflowdoc.metatask_throttles
 
-      # Get the scheduler
-      @bq_server = BQSProxy.new(workflowdoc.scheduler, @config, @options)
-
-      # Add this scheduler to the bqserver database if needed (skip in dryrun mode)
-      @db_server.add_bqservers([@bq_server.__drburi]) if @config.BatchQueueServer && !WorkflowMgr.dryrun_mode?
+      # Get the scheduler, served from a process of its own so that a wedged
+      # or crashed scheduler command costs a submission rather than the run.
+      # Nothing is recorded in the bqservers table any more: there is no
+      # server outliving this run for a later one to find.
+      @bq_server = if @config.BatchQueueServer && !WorkflowMgr.dryrun_mode? && !@broker.nil?
+                     BatchProxy.new(@broker.spawn(BatchActor, workflowdoc.scheduler_name,
+                                                  @config.SubmitThreads, @config.JobQueueTimeout,
+                                                  @config.JobAcctTimeout,
+                                                  name: 'batch',
+                                                  source: File.expand_path('batch_actor.rb', __dir__)))
+                   else
+                     BatchActor.new(workflowdoc.scheduler_name, @config.SubmitThreads,
+                                    @config.JobQueueTimeout, @config.JobAcctTimeout,
+                                    dryrun: WorkflowMgr.dryrun_mode?)
+                   end
 
       # Get the log parameters
       @log_server = workflowdoc.log
@@ -1247,126 +1246,38 @@ module WorkflowMgr
     # harvest_pending_jobids
     #
     ##########################################
+    # Every submission this run starts is waited for before the run ends, so
+    # a job still marked SUBMITTING was written down by a run that died
+    # between handing the job to the scheduler and hearing back. Its row is
+    # the only evidence that happened, and there is no longer any server to
+    # ask what became of it.
+    #
+    # It is dropped and left to be submitted again, which is what rocoto has
+    # always done when it could not find out -- and, as it has always said,
+    # that job may in fact be queued, in which case this submits it twice.
+    # Closing that hole means searching the scheduler for the marker below
+    # rather than guessing, which is work still to do.
     def harvest_pending_jobids
-      # In dryrun mode, no DRb-backed BQServers exist and no real submissions
-      # were made, so skip all pending-job harvesting and DB mutations.
       return if WorkflowMgr.dryrun_mode?
 
-      # Initialize hash of old bqserver processes from the database and establish connections to them
-      bqservers = {}
-      @db_server.load_bqservers.each do |uri|
-        # We are only interested in old bqserver processes
-        # In dryrun mode, no DRb server is launched, so skip this check
-        next if !WorkflowMgr.dryrun_mode? && uri == @bq_server.__drburi
+      orphaned = @active_jobs.values.collect(&:values).flatten.select(&:pending_submit?)
 
-        bqservers[uri] = DRbObject.new(nil, uri) unless bqservers.key?(uri)
+      orphaned.each do |job|
+        cycle = job.cycle.strftime('%Y%m%d%H%M')
+        msg = "Submission status of #{job.task} for cycle #{cycle} could not be retrieved, because the run " \
+              "that submitted it (marker #{job.id}) ended before the scheduler answered"
+        WorkflowMgr.stderr(msg, 2)
+        @log_server.log(job.cycle, msg)
+        msg = "Submission of #{job.task} for cycle #{cycle} probably, but not " \
+              "necessarily, failed.  It will be resubmitted"
+        WorkflowMgr.stderr(msg, 2)
+        @log_server.log(job.cycle, msg)
 
-      # The bqserver has died!
-      rescue DRb::DRbConnError
-        # Remove the bqserver uri from the database
-        @db_server.delete_bqservers([uri])
-
-        # Remove the bqserver uri from the bqservers list if needed
-        bqservers.delete(uri) if bqservers.key?(uri)
-      end
-
-      begin
-        # Loop over active jobs looking for ones with pending submissions
-        sorted_jobs = @active_jobs.values.collect(&:values).flatten.sort_by do |job|
-          [job.cycle,
-           @tasks[job.task].nil? ? 999_999_999 : @tasks[job.task].seq]
-        end
-        sorted_jobs.each do |job|
-          # Skip jobs that don't have pending job ids
-          next unless job.pending_submit?
-
-          # Get the URI of the workflowbqserver that submitted the job
-          uri = job.id
-
-          begin
-            # Query the workflowbqserver for the status of the job submission
-            jobid, output = bqservers[uri].get_submit_status(job.task, job.cycle) if bqservers.key?(uri)
-
-          # Catch exceptions for bqservers that have died unexpectedly
-          rescue DRb::DRbConnError
-            # Remove the bqserver uri from the database
-            @db_server.delete_bqservers([uri])
-
-            # Remove the bqserver uri from the bqservers list if needed
-            bqservers.delete(uri) if bqservers.key?(uri)
-          end
-
-          # If the bqserver died, warn user, resubmit job
-          if !bqservers.key?(uri)
-
-            # Log the fact that the submission status could not be retrieved
-            msg = "Submission status of #{job.task} for cycle #{job.cycle.strftime('%Y%m%d%H%M')} could not be " \
-                  "retrieved because the server process at #{uri} died"
-            WorkflowMgr.stderr(msg, 2)
-            @log_server.log(job.cycle, msg)
-            msg = "Submission of #{job.task} for cycle #{job.cycle.strftime('%Y%m%d%H%M')} probably, but not " \
-                  "necessarily, failed.  It will be resubmitted"
-            WorkflowMgr.stderr(msg, 2)
-            @log_server.log(job.cycle, msg)
-
-            # Delete the job from the database since it failed to submit.  It will be retried immediately.
-            @db_server.delete_jobs([job])
-
-            # Remove the job from the active_jobs list since it failed to submit and is not active.
-            @active_jobs[job.task].delete(job.cycle)
-            @active_jobs.delete(job.task) if @active_jobs[job.task].empty?
-
-            next
-
-          # If there is no output from the submission, it means the submission is still pending
-          elsif output.nil?
-            @log_server.log(job.cycle,
-                            "Submission status of #{job.task} is still pending at #{uri}.  The batch system " \
-                            "server may be down, unresponsive, or under heavy load.")
-
-          # Otherwise, the submission either succeeded or failed.
-          elsif jobid.nil?
-
-            # If the job submission failed, log the output of the job submission command, and print it to stdout as well
-            @db_server.delete_jobs([job])
-
-            # Remove the job from the active_jobs list since it failed to submit and is not active.
-            @active_jobs[job.task].delete(job.cycle)
-            @active_jobs.delete(job.task) if @active_jobs[job.task].empty?
-
-            WorkflowMgr.stderr(output, 1)
-            @log_server.log(job.cycle, "Submission status of previously pending #{job.task} is failure!  #{output}")
-
-            next
-
-            # Delete the job from the database since it failed to submit.  It will be retried immediately.
-
-            # If the job succeeded, record the jobid and log it
-          else
-            job.id = jobid
-            @log_server.log(job.cycle,
-                            "Submission status of previously pending #{job.task} is success, jobid=#{jobid}")
-
-          end
-
-          # Update the job in the database
-          @db_server.update_jobs([job])
-        end
-      ensure
-        # Make sure we always terminate all workflowbqservers that we no longer need
-        bqservers.each do |uri, bqserver|
-          unless bqserver.running?
-            bqserver.stop!
-            @db_server.delete_bqservers([uri])
-          end
-        # Catch exceptions for bqservers that have died unexpectedly
-        rescue DRb::DRbConnError
-          msg = "WARNING! BQS Server process at #{uri} died unexpectedly.  " \
-                "Submission status of some jobs may have been lost"
-          WorkflowMgr.stderr(msg, 2)
-          WorkflowMgr.log(msg)
-          @db_server.delete_bqservers([uri])
-        end
+        # Dropped from the database and from this run's picture of what is
+        # active, so the task is eligible to be submitted again below.
+        @db_server.delete_jobs([job])
+        @active_jobs[job.task].delete(job.cycle)
+        @active_jobs.delete(job.task) if @active_jobs[job.task].empty?
       end
     end
 
@@ -1906,13 +1817,11 @@ module WorkflowMgr
             @active_metatask_instance_count[metatask] += 1
           end
 
-          # If we are resubmitting the job, initialize the new job to the old job
-          # In dryrun mode, no DRb server is launched, so use 0 as placeholder
-          newjobid = if @config.BatchQueueServer && !WorkflowMgr.dryrun_mode?
-                       @bq_server.__drburi
-                     else
-                       0
-                     end
+          # A marker standing in for the jobid until the scheduler gives us a
+          # real one. Its purpose is to leave evidence: a row in this state is
+          # a submission that was started and never confirmed, and it is
+          # unique so that the submission can be identified later.
+          newjobid = SecureRandom.uuid
           newjob = if resubmit
                      Job.new(newjobid, # jobid
                              task.attributes[:name],   # taskname
@@ -1991,13 +1900,6 @@ module WorkflowMgr
             @log_server.log(cycletime, "Submitting #{task.attributes[:name]}")
           end
         end
-      end
-
-      # If we are not using a batch queue server, shut down the pool, which blocks until all
-      # queued submissions have finished running, before checking for job ids.
-      # Skip in dryrun mode - thread pool workers sleep indefinitely waiting for work and cause deadlock
-      unless @config.BatchQueueServer || WorkflowMgr.dryrun_mode?
-        @bq_server.shutdown
       end
 
       # Harvest job ids for submitted tasks
