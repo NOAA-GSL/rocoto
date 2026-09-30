@@ -3,142 +3,325 @@
 require 'English'
 require 'spec_helper'
 require 'fileutils'
+require 'tmpdir'
+require 'sqlite3'
+require 'rocoto_actor'
+require 'workflowmgr/database_actor'
 require 'workflowmgr/workflowdb'
 
 RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
   describe 'workflow locking' do
-    let(:databasefile) { 'test.db' }
-    let(:lockfile) { 'test_lock.db' }
+    let(:dir) { Dir.mktmpdir('rocoto-lock-spec-') }
+    let(:databasefile) { File.join(dir, 'workflow.db') }
+    let(:lockfile) { File.join(dir, 'workflow_lock.db') }
 
+    # Created before anything forks. These are lazily memoized, so a child
+    # that mentioned them first would make its own temporary directory and
+    # lock a database the parent never sees.
     before do
-      FileUtils.rm_f(databasefile)
-      FileUtils.rm_f(lockfile)
+      dir
     end
 
     after do
-      FileUtils.rm_f(databasefile)
-      FileUtils.rm_f(lockfile)
+      FileUtils.remove_entry(dir, true)
     end
 
-    it 'properly locks and serializes database access across processes' do
-      skip 'Flaky test with race conditions - needs redesign with proper IPC instead of sleep-based timing'
+    # Read the lock table directly, rather than through the class under test.
+    def lock_rows
+      db = SQLite3::Database.new(lockfile)
+      db.execute('SELECT * FROM lock;')
+    ensure
+      db&.close
+    end
 
-      # Initialize a workflow SQLite database
+    def lock_owner
+      lock_rows.first&.first
+    end
+
+    it 'refuses the lock while another live process holds it, and grants it once released' do
+      told_locked, report_locked = IO.pipe
+      may_release, release_now = IO.pipe
+
+      holder = fork do
+        told_locked.close
+        release_now.close
+        held = described_class.new(databasefile)
+        held.dbopen
+        report_locked.puts(held.lock_workflow ? 'LOCKED' : 'REFUSED')
+        report_locked.close
+        may_release.gets # hold the workflow until told to let go
+        held.unlock_workflow
+        exit!(0)
+      end
+      report_locked.close
+      may_release.close
+
+      expect(told_locked.gets.chomp).to eq('LOCKED')
+
+      ours = described_class.new(databasefile)
+      ours.dbopen
+      expect(ours.lock_workflow).to be false
+
+      release_now.puts('go')
+      release_now.close
+      Process.wait(holder)
+
+      expect(ours.lock_workflow).to be true
+      ours.unlock_workflow
+    ensure
+      told_locked&.close
+      release_now&.close
+    end
+
+    it 'reports whether there was a lock of ours to release' do
+      database = described_class.new(databasefile)
+      database.dbopen
+      database.lock_workflow
+
+      expect(database.unlock_workflow).to be true
+
+      # Nothing left to give back means someone judged our lock stale and
+      # took it, so for a while two runs may have been advancing the same
+      # workflow. The caller has to be able to tell that from a clean
+      # release, rather than reporting the run as a success.
+      expect(database.unlock_workflow).to be false
+    end
+
+    it 'says why, at ordinary verbosity, when there was no lock of ours to release' do
+      # The run ends non-zero because of this. Reported above the default
+      # verbosity it would reach nobody, leaving a cron user with a failure
+      # and an empty message.
+      allow(WorkflowMgr).to receive(:stderr)
+      allow(WorkflowMgr).to receive(:log)
+
+      database = described_class.new(databasefile)
+      database.dbopen
+      database.lock_workflow
+      database.unlock_workflow
+
+      expect(database.unlock_workflow).to be false
+      expect(WorkflowMgr).to have_received(:stderr).with(/no workflow lock to release/, 1)
+    end
+
+    # Write a lock row directly, so a held lock can be set up without a second
+    # process. A numeric TEST-NET address stands in for another host: the code
+    # calls getaddrinfo on whatever it finds here, and a numeric address
+    # resolves without DNS or a timeout.
+    def hold_lock(pid:, host:, age_seconds:)
+      db = SQLite3::Database.new(lockfile)
+      db.execute('INSERT INTO lock VALUES (?,?,?);', [pid, host, Time.now.to_i - age_seconds])
+    ensure
+      db&.close
+    end
+
+    def local_ip
+      Socket.getaddrinfo(Socket.gethostname, nil, nil, Socket::SOCK_STREAM)[0][3]
+    end
+
+    it 'says why, at ordinary verbosity, when another run holds the lock' do
+      # Returning false here is what makes the run exit non-zero. Reported
+      # above the default verbosity, as it was, the explanation reached the
+      # log file alone and a cron user got a failure with an empty mail body.
+      allow(WorkflowMgr).to receive(:stderr)
+      allow(WorkflowMgr).to receive(:log)
+
+      database = described_class.new(databasefile, 424_242)
+      database.dbopen
+      # This process is alive, so its lock is not stale.
+      hold_lock(pid: Process.pid, host: local_ip, age_seconds: 0)
+
+      expect(database.lock_workflow).to be false
+      expect(WorkflowMgr).to have_received(:stderr).with(/Workflow is locked by pid/, 1)
+    end
+
+    it 'steals a lock from another host once its owner is gone' do
+      database = described_class.new(databasefile, 424_242, 1)
+      database.dbopen
+      hold_lock(pid: 999_999, host: '203.0.113.1', age_seconds: 3600)
+      # A non-zero ssh probe means the owner is no longer running.
+      allow(database).to receive(:system).and_return(false)
+
+      expect(database.lock_workflow).to be true
+      expect(lock_owner).to eq(424_242)
+    end
+
+    it 'probes the remote owner with an argument list, never a shell string' do
+      # The host and pid come out of the lock table. Built into one string
+      # they would be interpreted by a shell, so the call has to stay a list.
+      database = described_class.new(databasefile, 424_242, 1)
+      database.dbopen
+      hold_lock(pid: 999_999, host: '203.0.113.1', age_seconds: 3600)
+      allow(database).to receive(:system).and_return(false)
+
+      database.lock_workflow
+
+      expect(database).to have_received(:system)
+        .with('ssh', '-o', 'StrictHostKeyChecking=no', '203.0.113.1', 'kill', '-0', '999999',
+              hash_including(:out, :err))
+    end
+
+    it 'leaves a lock alone while its remote owner still answers' do
+      database = described_class.new(databasefile, 424_242, 1)
+      database.dbopen
+      hold_lock(pid: 999_999, host: '203.0.113.1', age_seconds: 3600)
+      # A zero exit means the owner is still running.
+      allow(database).to receive(:system).and_return(true)
+
+      expect(database.lock_workflow).to be false
+      expect(lock_owner).to eq(999_999)
+    end
+
+    it 'waits StaleLockTimeout before suspecting a remote lock at all' do
+      # The age is chosen to sit between the configured timeout and the 300
+      # seconds this used to be hardcoded to. Anything below both would be
+      # left alone either way, and the example would pass whether or not the
+      # setting is consulted at all.
+      database = described_class.new(databasefile, 424_242, 3600)
+      database.dbopen
+      hold_lock(pid: 999_999, host: '203.0.113.1', age_seconds: 600)
+      allow(database).to receive(:system).and_return(false)
+
+      expect(database.lock_workflow).to be false
+      expect(database).not_to have_received(:system)
+    end
+
+    it 'does not retry taking the lock, since a retry reads our own row as someone else\'s' do
+      # Every other database call is retried when SQLite reports the file
+      # busy. Taking the lock must not be: by the time it can fail, its row
+      # may already be committed, and a second attempt would read that row
+      # as another process's lock and report failure -- leaving the caller
+      # to abandon a workflow it actually holds, without unlocking it.
       database = described_class.new(databasefile)
       database.dbopen
 
-      # Add a test table to the database
-      dbhandle = SQLite3::Database.new(databasefile)
-      dbhandle.transaction do |db|
-        db.execute('CREATE TABLE test (val INTEGER);')
-        db.execute('INSERT INTO test VALUES (0);')
+      calls = 0
+      allow(database).to receive(:open_workflow_db).and_wrap_original do |original|
+        calls += 1
+        raise WorkflowMgr::WorkflowDBLockedException, 'database is locked' if calls == 1
+
+        original.call
       end
-      dbhandle.close
 
-      # Create a worker script that simulates a rocotorun process
-      lib_path = File.expand_path('../../lib', __dir__)
-      worker_script = <<~RUBY
-        #!/usr/bin/env ruby
-        $LOAD_PATH.unshift('#{lib_path}')
+      expect { database.lock_workflow }.to raise_error(WorkflowMgr::WorkflowDBLockedException)
+      expect(calls).to eq(1)
+    end
 
-        require 'sqlite3'
-        require 'workflowmgr/workflowdb'
+    it 'retries the calls that are safe to repeat' do
+      database = described_class.new(databasefile)
+      database.dbopen
+      database.lock_workflow
 
-        databasefile = ARGV[0]
-        action = ARGV[1]
+      # The failure is injected into the SQLite handle rather than into
+      # load_cycles itself: stubbing the method would put the stub in front
+      # of the prepended retry module, so no retry could ever run and the
+      # example would pass whether or not one exists.
+      handle = database.instance_variable_get(:@database)
+      calls = 0
+      allow(handle).to receive(:execute).and_wrap_original do |original, *args|
+        calls += 1
+        raise SQLite3::BusyException, 'database is locked' if calls == 1
 
-        database = WorkflowMgr::WorkflowSQLite3DB.new(databasefile)
+        original.call(*args)
+      end
+
+      expect(database.load_cycles).to eq([])
+      expect(calls).to eq(2)
+
+      database.unlock_workflow
+    end
+
+    it 'can be served from a process that loaded nothing but this file' do
+      # Run somewhere clean on purpose. Every other example here has already
+      # loaded the actor code for its own reasons, which would hide a
+      # missing require in the file under test -- exactly the kind of break
+      # that only shows up the first time rocotorun is run for real.
+      script = <<~RUBY
+        $LOAD_PATH.unshift(#{File.expand_path('../../lib', __dir__).inspect})
+        require "rocoto_actor"
+        require "workflowmgr/workflowdb"
+
+        config = Struct.new(:DatabaseType, :DatabaseServer, :StaleLockTimeout).new("SQLite3", true, 300)
+        options = Struct.new(:database).new(#{databasefile.inspect})
+
+        broker = RocotoActor::ActorBroker.new
+        database = WorkflowMgr.workflow_database(config, options, broker)
         database.dbopen
-
-        case action
-        when 'lock'
-          # Acquire lock and hold it briefly
-          success = database.lock_workflow
-          if success
-            # Write that we have the lock
-            puts "LOCKED"
-            # Hold the lock for a moment
-            sleep 0.5
-            database.unlock_workflow
-          else
-            puts "FAILED"
-            exit 1
-          end
-        when 'increment'
-          # Acquire lock, increment counter, release
-          success = database.lock_workflow
-          if success
-            dbhandle = SQLite3::Database.new(databasefile)
-            dbhandle.transaction do |db|
-              val = db.execute('SELECT val FROM test')[0][0]
-              db.execute("UPDATE test SET val=\#{val + 1}")
-            end
-            dbhandle.close
-            database.unlock_workflow
-            puts "INCREMENTED"
-          else
-            puts "FAILED"
-            exit 1
-          end
-        end
-
-        exit 0
+        database.stop!
+        broker.stop
+        puts "SERVED"
       RUBY
 
-      # Write the worker script
-      worker_file = 'test_worker.rb'
-      File.write(worker_file, worker_script)
+      script_file = File.join(dir, 'fresh_load.rb')
+      File.write(script_file, script)
 
-      begin
-        # Test 1: Sequential operations should all succeed
-        5.times do
-          result = `bundle exec ruby #{worker_file} #{databasefile} increment 2>&1`
-          expect(result).to include("INCREMENTED")
-          expect($CHILD_STATUS.exitstatus).to eq(0)
-        end
+      expect(`#{RbConfig.ruby} #{script_file} 2>&1`).to include('SERVED')
+    end
 
-        # Verify counter
-        dbhandle = SQLite3::Database.new(databasefile)
-        val = dbhandle.execute('SELECT val FROM test')[0][0]
-        dbhandle.close
-        expect(val).to eq(5)
+    # The database served from its own process, the way rocoto runs it.
+    # Rocoto's configuration exposes these exact names, so the struct has to
+    # use them whatever Ruby style guides say about method names.
+    def actor_backed_database(broker)
+      config = Struct.new(:DatabaseType, :DatabaseServer, :StaleLockTimeout) # rubocop:disable Naming/MethodName
+                     .new('SQLite3', true, 300)
+      options = Struct.new(:database).new(databasefile)
+      WorkflowMgr.workflow_database(config, options, broker)
+    end
 
-        # Test 2: One process holds lock while another tries to acquire
-        # Start a process that will hold the lock
-        holder_pid = spawn("bundle exec ruby #{worker_file} #{databasefile} lock", out: '/dev/null', err: '/dev/null')
+    it 'records the pid of the rocoto process, not of the actor that writes it' do
+      broker = RocotoActor::ActorBroker.new
+      database = actor_backed_database(broker)
+      database.dbopen
 
-        # Wait for it to acquire the lock
-        sleep 0.2
+      expect(database.lock_workflow).to be true
+      expect(lock_owner).to eq(Process.pid)
 
-        # Try to increment while the lock is held - should fail/timeout
-        start_time = Time.now
-        competitor_pid = spawn("bundle exec ruby #{worker_file} #{databasefile} increment",
-                               out: '/dev/null', err: '/dev/null')
+      # The lock belongs to the run. Recording the actor's pid instead would
+      # make the lock look abandoned the moment the actor was replaced.
+      actor_pid = broker.describe[:actors].first[:pid]
+      expect(actor_pid).not_to be_nil
+      expect(lock_owner).not_to eq(actor_pid)
 
-        # The competitor should wait for the lock to be released
-        _pid, _status = Process.wait2(competitor_pid)
-        elapsed = Time.now - start_time
+      database.unlock_workflow
+    ensure
+      broker&.stop
+    end
 
-        # Should have waited at least 0.3 seconds (lock was held for 0.5s, we waited 0.2s before starting)
-        expect(elapsed).to be >= 0.2
+    it 'keeps the lock when its actor dies but the rocoto process holding it is still alive' do
+      told_actor_pid, report_actor_pid = IO.pipe
+      may_finish, finish_now = IO.pipe
 
-        # Wait for holder to finish
-        Process.wait2(holder_pid)
-
-        # Competitor might have succeeded or failed depending on timing
-        # If it succeeded, counter should be 6, if failed should still be 5
-        dbhandle = SQLite3::Database.new(databasefile)
-        val = dbhandle.execute('SELECT val FROM test')[0][0]
-        dbhandle.close
-        expect(val).to be_between(5, 6)
-      ensure
-        # Clean up
-        FileUtils.rm_f(worker_file)
-        FileUtils.rm_f('test_worker_0.out')
-        FileUtils.rm_f('test_worker_0.err')
-        FileUtils.rm_f('test_worker_1.out')
-        FileUtils.rm_f('test_worker_1.err')
+      owner = fork do
+        told_actor_pid.close
+        finish_now.close
+        broker = RocotoActor::ActorBroker.new
+        database = actor_backed_database(broker)
+        database.dbopen
+        database.lock_workflow
+        report_actor_pid.puts(broker.describe[:actors].first[:pid])
+        report_actor_pid.close
+        may_finish.gets # stay alive, still owning the workflow
+        exit!(0)
       end
+      report_actor_pid.close
+      may_finish.close
+
+      # The actor that took the lock is gone; the run that owns it is not.
+      Process.kill('KILL', told_actor_pid.gets.to_i)
+
+      other = described_class.new(databasefile)
+      other.dbopen
+      expect(other.lock_workflow).to be false
+
+      finish_now.puts('done')
+      finish_now.close
+      Process.wait(owner)
+
+      # Now that the owner is gone too, the lock really is abandoned.
+      expect(other.lock_workflow).to be true
+      other.unlock_workflow
+    ensure
+      told_actor_pid&.close
+      finish_now&.close
     end
   end
 end

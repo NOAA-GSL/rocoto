@@ -42,6 +42,28 @@ module WorkflowMgr
 
     ##########################################
     #
+    # to_wire / from_wire
+    #
+    # How a Cycle crosses an actor boundary. @state is left out on purpose:
+    # the constructor derives it from the four times, so sending it would
+    # risk carrying a state that contradicts them. These are also the only
+    # four values update_cycles writes, so what crosses the wire is exactly
+    # what the database keeps -- with one exception worth knowing:
+    # reactivate! sets @state without touching @activated, so a cycle
+    # reactivated in memory and then sent comes back in the state its times
+    # describe, the same as it would after being saved and loaded again.
+    #
+    ##########################################
+    def to_wire
+      [@cycle, { activated: @activated, expired: @expired, done: @done, draining: @draining }]
+    end
+
+    def self.from_wire(fields)
+      new(fields[0], fields[1])
+    end
+
+    ##########################################
+    #
     # to_s
     #
     ##########################################

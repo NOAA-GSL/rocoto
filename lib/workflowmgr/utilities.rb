@@ -133,12 +133,80 @@ module WorkflowMgr
 
   ##########################################
   #
+  # WorkflowMgr.message_sink
+  #
+  # When set, messages are handed to this instead of being written out. An
+  # actor installs one: its stderr goes to /dev/null and it knows neither
+  # the workflow id nor how verbose the user asked things to be, so whatever
+  # it has to say must travel back to the process that does know.
+  #
+  ##########################################
+  class << self
+    attr_accessor :message_sink
+  end
+
+  ##########################################
+  #
+  # WorkflowMgr.report_actor_error
+  #
+  # Handed to an ActorBroker as its error_handler. A failure on one of the
+  # broker's own threads belongs to no single call and can be reported
+  # nowhere else; the library's default writes a bare line to stderr, which
+  # carries no workflow id and ignores the verbosity the user asked for.
+  #
+  ##########################################
+  def self.report_actor_error(error, context)
+    message = "WARNING: rocoto actor system failed while #{context}: #{error.class}: #{error.message}"
+    stderr(message, 1)
+    log(message)
+    nil
+  rescue StandardError
+    # The broker undertakes never to let this handler's own failure escape
+    # onto one of its threads, and this keeps that cheap to honour.
+    nil
+  end
+
+  ##########################################
+  #
+  # WorkflowMgr.report_actor_event
+  #
+  # Handed to an ActorBroker as its on_event. An actor that dies while
+  # nothing happens to be talking to it would otherwise go unmentioned until
+  # some later call stumbled over it.
+  #
+  ##########################################
+  def self.report_actor_event(event, handle, detail)
+    # An orderly stop is routine and belongs in the log alone. Anything else
+    # explains behaviour the user can see.
+    level = event.to_s == 'stopped' ? 3 : 1
+    message = "rocoto actor #{actor_name(handle)} #{event}"
+    message += " (generation #{detail[:generation]})" unless detail[:generation].nil?
+    message += ": #{detail[:reason]}" unless detail[:reason].nil?
+    stderr(message, level)
+    log(message)
+    nil
+  rescue StandardError
+    nil
+  end
+
+  # The path is the name the actor was given and is what a reader will
+  # recognise; the id is a fallback for a node too far gone to answer.
+  def self.actor_name(handle)
+    handle.path
+  rescue StandardError
+    handle.id
+  end
+  private_class_method :actor_name
+
+  ##########################################
+  #
   # WorkflowMgr.stderr
   #
   ##########################################
   def self.stderr(message, level = 0)
     return if message.nil?
     return if message.empty?
+    return message_sink.call(:stderr, message, level) if message_sink
 
     verbose = defined?(WorkflowMgr::VERBOSE) ? WorkflowMgr::VERBOSE : 0
     workflow_id = defined?(WorkflowMgr::WORKFLOW_ID) ? WorkflowMgr::WORKFLOW_ID : 'unknown'
@@ -156,6 +224,7 @@ module WorkflowMgr
   def self.log(message)
     return if message.nil?
     return if message.empty?
+    return message_sink.call(:log, message, nil) if message_sink
 
     # Get workflow ID, or use 'unknown' if not defined
     workflow_id = defined?(WorkflowMgr::WORKFLOW_ID) ? WorkflowMgr::WORKFLOW_ID : 'unknown'

@@ -5,13 +5,18 @@
 ## Documentation
 Detailed documentation is provided at https://noaa-gsl.github.io/rocoto/
 
+The `rocoto_actor` library, which gives Rocoto its process-isolated actors, keeps
+its own documentation in [docs/rocoto_actor/](docs/rocoto_actor/): the
+architecture and concurrency model, the review brief, the Linux validation
+record, and the library's own README.
+
 ## Introduction
 Workflow Management is a concept that originated in the 1970's to handle business process management. Workflow management systems were developed to manage complex collections of business processes that need to be carried out in a certain way with complex interdependencies and requirements. Scientific Workflow Management is much newer, and is very much like its business counterpart, except that it is usually data oriented instead of process oriented. That is, scientific workflows are driven by the scientific data that "flows" through them. Scientific workflow tasks are usually triggered by the availability of some kind of input data, and a task's result is usually some kind of data that is fed as input to another task in the workflow. The individual tasks themselves are scientific codes that perform some kind of computation or retrieve or store some type of data for a computation. So, whereas a business workflow is comprised of a diverse set of processes that have to be completed in a certain way, sometimes carried out by a machine, sometimes carried out by a human being, a scientific workflow is usually comprised of a set of computations that are driven by the availability of input data.
 
 ## Installation
 
 ### Requirements
-- Ruby 3.2.0 or higher (Ruby 3.0 and 3.1 are no longer supported)
+- Ruby 3.3.0 or higher (Ruby 3.2 and earlier are no longer supported)
 
 ### Quick Start
 1. Clone or download Rocoto to your desired installation directory
@@ -37,10 +42,10 @@ Available options:
 - `--local` - Install from cached gems in vendor/cache/ (air-gapped mode)
 
 The installation script will:
-1. Verify Ruby version (≥ 3.2.0)
+1. Verify Ruby version (≥ 3.3.0)
 2. Install Bundler if not already available
 3. Update script shebangs to use the specified Ruby
-4. Install all gem dependencies to `vendor/bundle`
+4. Install all gem dependencies to `bundle/` (set by `.bundle/config`)
 
 ### Managing Dependencies
 
@@ -60,15 +65,25 @@ bundle outdated
 
 ## Testing
 
-Rocoto uses RSpec for testing. The test suite can be run locally or in CI.
+Rocoto has two test suites: RSpec specs under `spec/` covering Rocoto itself,
+and a Minitest suite under `test/rocoto_actor/` covering the `rocoto_actor`
+library in `lib/rocoto_actor/`. `rake` runs both. Either can be run locally or
+in CI; see `TESTING.md` for the full picture.
 
 ### Running Tests Locally
 
 After installation, run the test suite:
 
 ```bash
+# Run everything: the RSpec specs and the rocoto_actor Minitest suite
+bundle exec rake
+
 # Run all specs
 bundle exec rake spec
+
+# Run the rocoto_actor suite on its own. It spawns real actor processes and
+# takes about three minutes, so rake spec is the faster loop for Rocoto work.
+bundle exec rake test
 
 # Run specs with coverage report
 bundle exec rake coverage
@@ -81,15 +96,27 @@ bundle exec rspec spec/workflowmgr/cycledef_spec.rb
 
 # Run specs matching a pattern
 bundle exec rspec spec/workflowmgr/cycledef_spec.rb -e "exclude_hours"
+
+# Run a single rocoto_actor test file
+bundle exec rake test TEST=test/rocoto_actor/broker_restart_test.rb
 ```
 
 ### Continuous Integration
 
-The project uses GitHub Actions to automatically test against multiple Ruby versions:
-- Ruby 3.2.0 (minimum supported)
-- Ruby 3.2 (latest patch)
-- Ruby 3.3.0 (first release)
+The project uses GitHub Actions. The Rocoto specs run inside Slurm and PBS
+containers against every supported Ruby version:
+- Ruby 3.3.0 (minimum supported)
 - Ruby 3.3 (latest patch)
+- Ruby 3.4.1 (second release; 3.4.0 is excluded for a nokogiri ABI incompatibility)
+- Ruby 3.4 (latest patch)
+- Ruby 4.0.0 (first release)
+- Ruby 4.0 (latest patch)
+
+The `rocoto_actor` suite runs as its own job, without a container or a
+scheduler, on Ruby 3.3 and 3.4 under Linux and on Ruby 3.4 under macOS. macOS
+is included because it has caught process races that Linux did not. That
+matrix is narrower than the one above, which is a known gap rather than a
+decision to keep it narrow.
 
 Tests run on every push and pull request.
 

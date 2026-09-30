@@ -21,7 +21,7 @@ Options:
 
 Examples:
     ./INSTALL
-    ./INSTALL --with-ruby=/opt/ruby/3.2.0
+    ./INSTALL --with-ruby=/opt/ruby/3.3.0
     ./INSTALL --local  # Air-gapped installation using vendor/cache/
 
 EOF
@@ -73,9 +73,9 @@ echo "==> Using Ruby: $RUBY"
 RUBY_VERSION=$("$RUBY" -e "puts RUBY_VERSION")
 echo "==> Ruby version: $RUBY_VERSION"
 
-if ! "$RUBY" -e "exit(RUBY_VERSION >= '3.2.0' ? 0 : 1)"; then
-    echo "Error: Ruby 3.2.0 or higher is required (found $RUBY_VERSION)" >&2
-    echo "Note: Ruby 3.0 and 3.1 are no longer supported and do not receive security updates." >&2
+if ! "$RUBY" -e "exit(RUBY_VERSION >= '3.3.0' ? 0 : 1)"; then
+    echo "Error: Ruby 3.3.0 or higher is required (found $RUBY_VERSION)" >&2
+    echo "Note: Ruby 3.2 and earlier are no longer supported and do not receive security updates." >&2
     exit 1
 fi
 

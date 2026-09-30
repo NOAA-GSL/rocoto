@@ -1,0 +1,23 @@
+# RocotoActor was developed as a standalone library and keeps two naming
+# conventions of its own. They live here rather than in the root config
+# because RuboCop cannot vary a cop's parameters by path, and the two
+# codebases are cleanly split: Rocoto rescues into `e` in 32 places and never
+# into `error`, this library into `error` in 36 places and never into `e`.
+# One global setting would leave one of them permanently in violation.
+inherit_from: ../../.rubocop.yml
+
+# Rescued exceptions are named `error` throughout the library.
+Naming/RescuedExceptionsVariableName:
+  PreferredName: error
+
+# These are commands that report whether they succeeded, not predicates; a
+# trailing ? would promise no side effects. Enabled explicitly because the
+# root config sets NewCops: disable, which would otherwise leave the
+# deliberate inline disable in actor_node.rb reported as redundant.
+Naming/PredicateMethod:
+  Enabled: true
+  AllowedMethods:
+    - stop_subtrees
+    - expire
+    - wait_for_exit
+    - boot_succeeded

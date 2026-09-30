@@ -1,0 +1,329 @@
+##########################################
+#
+# module WorkflowMgr
+#
+# Batch system access, served from a process of its own.
+#
+# An actor is a fresh Ruby VM that loads exactly one file, and it inherits
+# the application's environment but not its $LOAD_PATH or its bundle, so
+# this file bootstraps both the way sbin/rocotorun.rb does.
+#
+##########################################
+standalone = File.expand_path('../../bundle/bundler/setup.rb', __dir__)
+require standalone if File.exist?(standalone)
+rocoto_lib = File.expand_path('..', __dir__)
+$LOAD_PATH.unshift(rocoto_lib) unless $LOAD_PATH.include?(rocoto_lib)
+
+require 'thread/pool'
+require 'workflowmgr/task'
+require 'workflowmgr/cobaltbatchsystem'
+require 'workflowmgr/lsfbatchsystem'
+require 'workflowmgr/moabbatchsystem'
+require 'workflowmgr/moabtorquebatchsystem'
+require 'workflowmgr/pbsprobatchsystem'
+require 'workflowmgr/slurmbatchsystem'
+require 'workflowmgr/torquebatchsystem'
+
+module WorkflowMgr
+  ##########################################
+  #
+  # Module BatchWire
+  #
+  # Turns what the batch system gives back into what the transport carries.
+  #
+  # Two things need help. The status records hold Times -- submit_time,
+  # start_time and end_time, all built with getgm -- and the output of a
+  # submit or a delete is whatever the scheduler printed, which is not
+  # guaranteed to be valid UTF-8 and so cannot travel as text.
+  #
+  ##########################################
+  module BatchWire
+    module_function
+
+    def encode(value)
+      case value
+      when Time then { wire: :time, at: value.to_i }
+      when String then encode_string(value)
+      when Array then value.map { |element| encode(element) }
+      when Hash then value.to_h { |key, element| [encode(key), encode(element)] }
+      else value
+      end
+    end
+
+    def decode(value)
+      case value
+      when Array then value.map { |element| decode(element) }
+      when Hash then decode_hash(value)
+      else value
+      end
+    end
+
+    def encode_string(value)
+      return value if value.encoding == Encoding::UTF_8 && value.valid_encoding?
+
+      as_utf8 = value.dup.force_encoding(Encoding::UTF_8)
+      return as_utf8 if as_utf8.valid_encoding?
+
+      { wire: :bytes, encoding: value.encoding.name, base64: [value.b].pack('m0') }
+    end
+
+    def decode_hash(hash)
+      case hash[:wire]
+      when :time then Time.at(hash[:at]).getgm
+      when :bytes then hash[:base64].unpack1('m0').force_encoding(hash[:encoding])
+      else hash.to_h { |key, value| [decode(key), decode(value)] }
+      end
+    end
+  end
+
+  ##########################################
+  #
+  # Class BatchConfig
+  #
+  # Every batch system asks its configuration for the same two numbers and
+  # nothing else, so the actor is handed the numbers rather than a
+  # configuration object it could not receive anyway.
+  #
+  ##########################################
+  class BatchConfig
+    def initialize(job_queue_timeout, job_acct_timeout)
+      @job_queue_timeout = job_queue_timeout
+      @job_acct_timeout = job_acct_timeout
+    end
+
+    # rubocop:disable Naming/MethodName
+    def JobQueueTimeout
+      @job_queue_timeout
+    end
+
+    def JobAcctTimeout
+      @job_acct_timeout
+    end
+    # rubocop:enable Naming/MethodName
+  end
+
+  ##########################################
+  #
+  # Class BatchActor
+  #
+  # What runs in the batch system process.
+  #
+  # Submission keeps its own thread pool, because an actor handles one
+  # message at a time and submitting hundreds of jobs one after another
+  # would take the sum of their latencies rather than the largest. So submit
+  # queues the work and returns at once, and get_submit_status waits for
+  # that one job's answer. The engine submits a whole batch before it
+  # harvests any of it, so by the time the first wait happens every
+  # submission is already in flight.
+  #
+  ##########################################
+  class BatchActor
+    # The wire contract: the operations receive will accept. Listed rather than
+    # computed, because asking the class would offer up receive, shutdown and
+    # the caller-facing submit as well.
+    #
+    # Note submit_parts rather than submit. A Task cannot cross the transport,
+    # so the wire carries the three plain things a batch system reads, and
+    # submit is the local convenience that decomposes a Task into them.
+    OPERATIONS = %i[submit_parts get_submit_status statuses delete].freeze
+
+    # Dryrun is passed in rather than read from WorkflowMgr.dryrun_mode?,
+    # because an actor is a fresh VM where that constant is not set. It is
+    # only ever true for the in-process case: a dryrun spawns no actor.
+    def initialize(scheduler, submit_threads, job_queue_timeout, job_acct_timeout, dryrun: false)
+      config = BatchConfig.new(job_queue_timeout, job_acct_timeout)
+      @batchsystem = WorkflowMgr.const_get("#{scheduler.upcase}BatchSystem").new(config)
+      @submit_threads = submit_threads
+      @dryrun = dryrun
+      @pool = nil
+      @waiting = {}
+      @answered = {}
+      @mutex = Mutex.new
+    end
+
+    def receive(message)
+      operation = message[:op]
+      raise NoMethodError, "#{operation} is not a batch system operation" unless OPERATIONS.include?(operation)
+
+      BatchWire.encode(public_send(operation, *BatchWire.decode(message[:args])))
+    end
+
+    ##########################################
+    #
+    # parts
+    #
+    # A task crosses as the three plain things a batch system reads from it:
+    # its attributes, its environment variables and its native directives.
+    # Everything else a Task carries -- above all the dependency trees --
+    # has nothing to do with submitting and never crosses.
+    #
+    # One place knows this, so the actor and the proxy cannot come to disagree
+    # about it. They did: the proxy decomposed and the actor did not, so the
+    # in-process path was handed a Task where it expected the parts.
+    #
+    ##########################################
+    def self.parts(task, cycle)
+      natives = []
+      task.each_native { |native| natives << native }
+      [task.attributes, task.envars, natives, cycle]
+    end
+
+    ##########################################
+    #
+    # submit
+    #
+    # Takes the Task, exactly as BatchProxy does, so that an in-process actor
+    # and an actor behind a proxy answer the same call. The engine holds one or
+    # the other depending on BatchQueueServer, and must not care which.
+    #
+    ##########################################
+    def submit(task, cycle)
+      submit_parts(*self.class.parts(task, cycle))
+    end
+
+    ##########################################
+    #
+    # submit_parts
+    #
+    # What crosses the transport, and what OPERATIONS names.
+    #
+    ##########################################
+    def submit_parts(attributes, envars, natives, cycle)
+      task = Task.new(0, attributes, envars, nil, nil)
+      natives.each { |native| task.add_native(native) }
+
+      answer = Queue.new
+      @mutex.synchronize { @waiting[key(attributes[:name], cycle)] = answer }
+
+      # A dryrun submits nothing and returns at once, so a pool would only
+      # leave threads sleeping for work that never comes.
+      if @dryrun
+        answer << @batchsystem.submit(task)
+      else
+        @pool ||= Thread.pool(@submit_threads)
+        @pool.process { answer << @batchsystem.submit(task) }
+      end
+      nil
+    end
+
+    ##########################################
+    #
+    # get_submit_status
+    #
+    # Waits for that submission to finish and answers [jobid, output], or
+    # [nil, output] when the scheduler refused it. A job this actor was
+    # never asked to submit answers [nil, nil], as it always has.
+    #
+    ##########################################
+    def get_submit_status(taskname, cycle)
+      id = key(taskname, cycle)
+      answered, waiting = @mutex.synchronize { [@answered[id], @waiting[id]] }
+      return answered unless answered.nil?
+      return [nil, nil] if waiting.nil?
+
+      result = waiting.pop
+      @mutex.synchronize do
+        @answered[id] = result
+        @waiting.delete(id)
+      end
+      result
+    end
+
+    def statuses(jobids)
+      @batchsystem.statuses(jobids)
+    end
+
+    def delete(jobid)
+      @batchsystem.delete(jobid)
+    end
+
+    ##########################################
+    #
+    # shutdown
+    #
+    # Called on a graceful stop, before the process exits. Waiting for the
+    # pool means a submission already handed to the scheduler finishes
+    # rather than being abandoned half done.
+    #
+    ##########################################
+    def shutdown
+      @pool&.shutdown
+      nil
+    end
+
+    ##########################################
+    #
+    # stop!
+    #
+    # An actor behind a proxy is stopped through its handle, and the engine's
+    # cleanup calls stop! on whatever it is holding. An in-process actor is the
+    # object itself, so without this its submission pool is never shut down and
+    # its workers sit waiting for work that will never arrive.
+    #
+    ##########################################
+    def stop!
+      shutdown
+    end
+
+    private
+
+    def key(taskname, cycle)
+      "#{taskname}\x00#{cycle.to_i}"
+    end
+  end
+
+  ##########################################
+  #
+  # Class BatchProxy
+  #
+  # The batch system as the rest of rocoto sees it.
+  #
+  ##########################################
+  class BatchProxy
+    # Submitting and asking after a submission both wait on the scheduler,
+    # which is slow far more often than it is broken.
+    TIMEOUT = 900
+
+    def initialize(handle)
+      @handle = handle
+    end
+
+    ##########################################
+    #
+    # submit
+    #
+    # Takes the Task, so that callers need not know what crosses. A task is
+    # far more than a submission needs -- dependency trees above all -- and
+    # none of that can be serialised, so what goes across is the three plain
+    # things a batch system actually reads.
+    #
+    ##########################################
+    def submit(task, cycle)
+      ask(:submit_parts, BatchActor.parts(task, cycle))
+    end
+
+    def method_missing(name, *args, &block)
+      return super unless BatchActor::OPERATIONS.include?(name)
+
+      raise ArgumentError, "#{name} was given a block, which cannot be sent to the batch system" if block
+
+      ask(name, args)
+    end
+
+    def respond_to_missing?(name, include_private = false)
+      BatchActor::OPERATIONS.include?(name) || super
+    end
+
+    def stop!
+      @handle.stop
+    end
+
+    attr_reader :handle
+
+    private
+
+    def ask(operation, args)
+      BatchWire.decode(@handle.ask(op: operation, args: BatchWire.encode(args)).value(timeout: TIMEOUT))
+    end
+  end
+end

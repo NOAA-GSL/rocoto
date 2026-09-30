@@ -10,6 +10,7 @@ module WFMStat
   #
   ##########################################
   class StatusEngine
+    require 'rocoto_actor'
     require 'workflowmgr/workflowdoc'
     require 'workflowmgr/workflowstate'
     require 'workflowmgr/workflowdb'
@@ -17,8 +18,6 @@ module WFMStat
     require "workflowmgr/cycle"
     require 'workflowmgr/dependency'
     require 'workflowmgr/workflowconfig'
-    require 'workflowmgr/launchserver'
-    require 'workflowmgr/dbproxy'
     require 'workflowmgr/workflowioproxy'
 
     ##########################################
@@ -56,8 +55,13 @@ module WFMStat
       # Get command line options
       @options = options
 
+      # The one broker for this invocation of rocoto. It owns every actor
+      # process rocoto starts, and stopping it stops all of them.
+      @broker = RocotoActor::ActorBroker.new(error_handler: WorkflowMgr.method(:report_actor_error),
+                                             on_event: WorkflowMgr.method(:report_actor_event))
+
       # Set up an object to serve the workflow database (but do not open the database)
-      @db_server = WorkflowMgr::DBProxy.new(@config, @options)
+      @db_server = WorkflowMgr.workflow_database(@config, @options, @broker)
     rescue StandardError => e
       WorkflowMgr.stderr(e.message, 1)
       WorkflowMgr.log(e.message)
@@ -78,7 +82,7 @@ module WFMStat
       @db_server.dbopen({ readonly: true })
 
       # Set up an object to serve file stat info
-      @workflow_io_server = WorkflowMgr::WorkflowIOProxy.new(@db_server, @config, @options)
+      @workflow_io_server = WorkflowMgr::WorkflowIOProxy.new(@db_server, @config, @options, @broker)
 
       # Open the workflow document
       @workflowdoc = WorkflowMgr::WorkflowXMLDoc.new(@options.workflowdoc, @workflow_io_server, @config)
@@ -105,14 +109,22 @@ module WFMStat
       Process.exit(1)
     ensure
       # Make sure we release the workflow lock in the database and shutdown the db_server
-      if !@db_server.nil? && @config.DatabaseServer
+      # Matches the condition the database was created under: in dryrun it
+      # is an ordinary object in this process, with nothing to shut down.
+      if !@db_server.nil? && @config.DatabaseServer && !WorkflowMgr.dryrun_mode?
         @db_server.stop!
       end
 
       # Make sure to shut down the workflow file stat server
-      if !@workflow_io_server.nil? && @config.WorkflowIOServer
+      # Matches the condition the server was created under: in dryrun the io
+      # object lives in this process and has nothing to shut down.
+      if !@workflow_io_server.nil? && @config.WorkflowIOServer && !WorkflowMgr.dryrun_mode?
         @workflow_io_server.stop!
       end
+
+      # Last, once the things that own actors have been shut down: stopping
+      # the broker stops every actor process along with it.
+      @broker&.stop
     end
 
     ##########################################
@@ -183,7 +195,7 @@ module WFMStat
       @db_server.dbopen({ readonly: true })
 
       # Set up an object to serve file stat info
-      @workflow_io_server = WorkflowMgr::WorkflowIOProxy.new(@db_server, @config, @options)
+      @workflow_io_server = WorkflowMgr::WorkflowIOProxy.new(@db_server, @config, @options, @broker)
 
       # Open the workflow document
       @workflowdoc = WorkflowMgr::WorkflowXMLDoc.new(@options.workflowdoc, @workflow_io_server, @config)
@@ -208,14 +220,22 @@ module WFMStat
       Process.exit(1)
     ensure
       # Make sure we release the workflow lock in the database and shutdown the db_server
-      if !@db_server.nil? && @config.DatabaseServer
+      # Matches the condition the database was created under: in dryrun it
+      # is an ordinary object in this process, with nothing to shut down.
+      if !@db_server.nil? && @config.DatabaseServer && !WorkflowMgr.dryrun_mode?
         @db_server.stop!
       end
 
       # Make sure to shut down the workflow file stat server
-      if !@workflow_io_server.nil? && @config.WorkflowIOServer
+      # Matches the condition the server was created under: in dryrun the io
+      # object lives in this process and has nothing to shut down.
+      if !@workflow_io_server.nil? && @config.WorkflowIOServer && !WorkflowMgr.dryrun_mode?
         @workflow_io_server.stop!
       end
+
+      # Last, once the things that own actors have been shut down: stopping
+      # the broker stops every actor process along with it.
+      @broker&.stop
     end
 
     ##########################################

@@ -6,12 +6,17 @@ plugins:
   - rubocop-rake
 
 AllCops:
-  TargetRubyVersion: 3.2
+  TargetRubyVersion: 3.3  # Matches the floor in the Gemfile
   NewCops: disable  # Don't automatically enable new cops
   Exclude:
     - 'vendor/**/*'
     - 'bundle/**/*'
-    - 'test/**/*'
+    # Legacy test/unit scripts predating the spec suite. Named individually
+    # rather than excluding all of test/, so that the rocoto_actor Minitest
+    # suite under test/rocoto_actor/ is linted like any other code.
+    - 'test/test_cycledef.rb'
+    - 'test/test_workflowdb.rb'
+    - 'test/test_workflowoption.rb'
     - 'lib/lockfile/**/*'  # Vendored third-party code
   SuggestExtensions: false
 

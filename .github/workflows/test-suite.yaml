@@ -8,6 +8,10 @@ on:
   pull_request:
     branches: [ develop, master ]
   workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: "Run the rocoto_actor soak harness for this many seconds (0 skips it; at most 20000, see its timeout-minutes)"
+        default: "0"
 
 jobs:
   lint:
@@ -21,14 +25,82 @@ jobs:
         name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.3'
           bundler-cache: true
       -
         name: Run RuboCop
         run: bundle exec rubocop --format github
 
-  test-rocoto-amd64:
-    name: Ruby ${{ matrix.label }}
+  # rocoto_actor's own suite needs no scheduler and no container, so it runs
+  # directly rather than as a step inside the Docker matrix below. It spawns
+  # real actor processes and takes about three minutes.
+  #
+  # macOS is here deliberately: it has caught two races that Linux never did.
+  # The Ruby matrix reaches 4.0 to match the Docker jobs below. The library's
+  # own CI only ever ran 3.3 and 3.4, so 4.0 is untested upstream: a failure
+  # there is news about the library, not about this workflow.
+  actor-suite:
+    name: RocotoActor Ruby ${{ matrix.ruby }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        ruby: ['3.3', '3.4', '4.0']
+        include:
+          - os: macos-latest
+            ruby: '3.4'
+    steps:
+      -
+        name: Checkout repository
+        uses: actions/checkout@v4
+      -
+        name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      -
+        name: Run the rocoto_actor Minitest suite
+        run: bundle exec rake test
+
+  # Manual only, and skipped unless soak_seconds is set to something non-zero.
+  # The harness drives continuous ask/tell traffic while injecting crashes,
+  # worker kills and respawns, and it fails if threads, file descriptors, child
+  # processes, zombies or RSS trend upward, so it is a leak detector rather
+  # than a pass/fail test of behaviour.
+  #
+  # This exercises the actor library alone. Soaking live Rocoto workflows with
+  # many jobs and induced failures of every type is wanted but not built.
+  soak:
+    name: Soak (manual)
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.soak_seconds != '0'
+    runs-on: ubuntu-latest
+    # At job level, as everywhere else in this workflow, so it bounds setup and
+    # the harness together rather than leaving the job on the implicit 360-minute
+    # default. A 20000s soak is about 333 minutes, which leaves roughly 17 for
+    # checkout, Ruby and bundler. An expression cannot derive this from
+    # soak_seconds, and hosted runners cap a job at 360 regardless.
+    timeout-minutes: 350
+    steps:
+      -
+        name: Checkout repository
+        uses: actions/checkout@v4
+      -
+        name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+      -
+        name: Soak
+        run: bundle exec ruby -Ilib test/rocoto_actor/soak/soak.rb
+        env:
+          SOAK_SECONDS: ${{ github.event.inputs.soak_seconds }}
+
+  test-rocoto-slurm:
+    name: Slurm Ruby ${{ matrix.label }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
@@ -39,12 +111,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - ruby-version: '3.2.0'
-            label: '3.2.0 (minimum supported)'
-          - ruby-version: '3.2'
-            label: '3.2 (latest patch)'
           - ruby-version: '3.3.0'
-            label: '3.3.0 (first release)'
+            label: '3.3.0 (minimum supported)'
           - ruby-version: '3.3'
             label: '3.3 (latest patch)'
           - ruby-version: '3.4.1'
@@ -156,12 +224,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - ruby-version: '3.2.0'
-            label: '3.2.0 (minimum supported)'
-          - ruby-version: '3.2'
-            label: '3.2 (latest patch)'
           - ruby-version: '3.3.0'
-            label: '3.3.0 (first release)'
+            label: '3.3.0 (minimum supported)'
           - ruby-version: '3.3'
             label: '3.3 (latest patch)'
           - ruby-version: '3.4.1'
@@ -293,7 +357,7 @@ jobs:
         name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.3'
           bundler-cache: true
       -
         name: Run specs with coverage

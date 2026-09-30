@@ -1,0 +1,27 @@
+# The rocoto_actor Minitest suite keeps the conventions it was written with.
+# Paths below are relative to this file, so they follow the suite rather than
+# its location in the host repository.
+#
+# Upstream also carved out Style/GlobalVars for the whole suite and
+# Lint/RescueException for the soak harness. Neither is repeated here: the
+# root config disables Style/GlobalVars outright, so there is nothing to
+# exempt, and Lint/RescueException currently reports nothing. If either starts
+# firing, upstream's .rubocop.yml is the record of what it allowed and why.
+inherit_from: ../../.rubocop.yml
+
+# Rescued exceptions are named `error` throughout rocoto_actor, tests included.
+Naming/RescuedExceptionsVariableName:
+  PreferredName: error
+
+# The soak and fault-matrix harnesses are operator tools that format progress
+# reports for a terminal, not library code.
+Style/FormatStringToken:
+  Exclude:
+    - "soak/**/*"
+    - "validation/**/*"
+
+# The fault matrix reads process status through the special globals on purpose;
+# the rewrite this cop suggests is marked unsafe.
+Style/SpecialGlobalVars:
+  Exclude:
+    - "validation/**/*"
