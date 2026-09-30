@@ -8,6 +8,10 @@ on:
   pull_request:
     branches: [ develop, master ]
   workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: "Run the rocoto_actor soak harness for this many seconds (0 skips it; at most 20000, see its timeout-minutes)"
+        default: "0"
 
 jobs:
   lint:
@@ -60,6 +64,40 @@ jobs:
       -
         name: Run the rocoto_actor Minitest suite
         run: bundle exec rake test
+
+  # Manual only, and skipped unless soak_seconds is set to something non-zero.
+  # The harness drives continuous ask/tell traffic while injecting crashes,
+  # worker kills and respawns, and it fails if threads, file descriptors, child
+  # processes, zombies or RSS trend upward, so it is a leak detector rather
+  # than a pass/fail test of behaviour.
+  #
+  # This exercises the actor library alone. Soaking live Rocoto workflows with
+  # many jobs and induced failures of every type is wanted but not built.
+  soak:
+    name: Soak (manual)
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.soak_seconds != '0'
+    runs-on: ubuntu-latest
+    # At job level, as everywhere else in this workflow, so it bounds setup and
+    # the harness together rather than leaving the job on the implicit 360-minute
+    # default. A 20000s soak is about 333 minutes, which leaves roughly 17 for
+    # checkout, Ruby and bundler. An expression cannot derive this from
+    # soak_seconds, and hosted runners cap a job at 360 regardless.
+    timeout-minutes: 350
+    steps:
+      -
+        name: Checkout repository
+        uses: actions/checkout@v4
+      -
+        name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+      -
+        name: Soak
+        run: bundle exec ruby -Ilib test/rocoto_actor/soak/soak.rb
+        env:
+          SOAK_SECONDS: ${{ github.event.inputs.soak_seconds }}
 
   test-rocoto-amd64:
     name: Ruby ${{ matrix.label }}
