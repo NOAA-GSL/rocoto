@@ -103,7 +103,10 @@ module WorkflowMgr
 
           # If no lock is present, we have acquired the lock.  Write the WFM's pid and host into the lock table
           if lock.empty?
-            db.execute("INSERT INTO lock VALUES (#{Process.pid},'#{Socket.getaddrinfo(Socket.gethostname, nil, nil, Socket::SOCK_STREAM)[0][3]}',#{Time.now.to_i});")
+            db.execute("INSERT INTO lock VALUES (?,?,?);",
+                       [Process.pid,
+                        Socket.getaddrinfo(Socket.gethostname, nil, nil, Socket::SOCK_STREAM)[0][3],
+                        Time.now.to_i])
 
           # Otherwise, we didn't get the lock, but we need to check to make sure the lock is not stale
           else
@@ -123,8 +126,10 @@ module WorkflowMgr
             elsif Time.now - Time.at(lock[0][2]) > 300
               begin
                 WorkflowMgr.timeout(10) do
-                  system("ssh -o StrictHostKeyChecking=no #{lock[0][1]} kill -0 #{lock[0][0]} 2>&1 > /dev/null")
-                  stale = $CHILD_STATUS.exitstatus != 0
+                  ok = system('ssh', '-o', 'StrictHostKeyChecking=no',
+                              lock[0][1].to_s, 'kill', '-0', lock[0][0].to_s,
+                              out: File::NULL, err: File::NULL)
+                  stale = !ok
                 end
               rescue Timeout::Error
                 stale = true
@@ -136,7 +141,8 @@ module WorkflowMgr
             lockhostinfo = Socket.getaddrinfo(lock[0][1], nil)[0]
             if stale
               db.execute("DELETE FROM lock;")
-              db.execute("INSERT INTO lock VALUES (#{Process.pid},'#{localhostinfo[3]}',#{Time.now.to_i});")
+              db.execute("INSERT INTO lock VALUES (?,?,?);",
+                         [Process.pid, localhostinfo[3], Time.now.to_i])
               msg = "WARNING: Rocoto pid #{Process.pid} on host #{localhostinfo[2]} (#{localhostinfo[3]}) " \
                     "stole stale lock from Rocoto pid #{lock[0][0]} on host " \
                     "#{lockhostinfo[2]} (#{lockhostinfo[3]})."
@@ -156,7 +162,7 @@ module WorkflowMgr
         open_workflow_db
         true
       rescue WorkflowMgr::WorkflowLockedException
-        WorkflowMgr.stderr($ERROR_INFO.to_s, 3)
+        WorkflowMgr.stderr($ERROR_INFO.to_s, 1)
         WorkflowMgr.log($ERROR_INFO.to_s)
         false
       rescue SQLite3::BusyException
@@ -198,7 +204,7 @@ module WorkflowMgr
           end
         end
       rescue WorkflowMgr::WorkflowLockedException
-        WorkflowMgr.stderr($ERROR_INFO.to_s, 3)
+        WorkflowMgr.stderr($ERROR_INFO.to_s, 1)
         WorkflowMgr.log($ERROR_INFO.to_s)
         Process.exit(1)
       rescue SQLite3::BusyException

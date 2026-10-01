@@ -20,6 +20,100 @@ RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
       FileUtils.rm_f(lockfile)
     end
 
+    # Read the lock table directly, rather than through the class under test.
+    def lock_rows
+      db = SQLite3::Database.new(lockfile)
+      db.execute('SELECT * FROM lock;')
+    ensure
+      db&.close
+    end
+
+    def lock_owner
+      lock_rows.first&.first
+    end
+
+    # Write a lock row directly, so a held lock can be set up without a second
+    # process. dbopen creates the table, so this must follow it. A numeric
+    # TEST-NET address stands in for another host: the code calls getaddrinfo on
+    # whatever it finds here, and a numeric address resolves without DNS.
+    def hold_lock(pid:, host:, age_seconds:)
+      db = SQLite3::Database.new(lockfile)
+      db.execute('INSERT INTO lock VALUES (?,?,?);', [pid, host, Time.now.to_i - age_seconds])
+    ensure
+      db&.close
+    end
+
+    def local_ip
+      Socket.getaddrinfo(Socket.gethostname, nil, nil, Socket::SOCK_STREAM)[0][3]
+    end
+
+    it 'says why, at ordinary verbosity, when another run holds the lock' do
+      # Returning false here is what makes the run exit non-zero. Reported above
+      # the default verbosity, as it was, the explanation reached the log file
+      # alone and a cron user got a failure with an empty mail body.
+      allow(WorkflowMgr).to receive(:stderr)
+      allow(WorkflowMgr).to receive(:log)
+
+      database = described_class.new(databasefile)
+      database.dbopen
+      # This process is alive, so its lock is not judged stale.
+      hold_lock(pid: Process.pid, host: local_ip, age_seconds: 0)
+
+      expect(database.lock_workflow).to be false
+      expect(WorkflowMgr).to have_received(:stderr).with(/Workflow is locked by pid/, 1)
+    end
+
+    it 'says why, at ordinary verbosity, when it cannot release a lock it does not hold' do
+      # This path calls Process.exit(1) directly, so there is no caller left to
+      # explain anything -- the message here is the only account the user gets.
+      allow(WorkflowMgr).to receive(:stderr)
+      allow(WorkflowMgr).to receive(:log)
+
+      database = described_class.new(databasefile)
+      database.dbopen
+      hold_lock(pid: 999_999, host: '203.0.113.1', age_seconds: 0)
+
+      expect { database.unlock_workflow }.to raise_error(SystemExit)
+      expect(WorkflowMgr).to have_received(:stderr).with(/cannot unlock the workflow/, 1)
+    end
+
+    it 'probes a remote lock owner with an argument list, never a shell string' do
+      # The host and pid come out of the lock table. Built into one string they
+      # would be interpreted by a shell, so the call has to stay a list.
+      database = described_class.new(databasefile)
+      database.dbopen
+      hold_lock(pid: 999_999, host: '203.0.113.1', age_seconds: 3600)
+      allow(database).to receive(:system).and_return(false)
+
+      database.lock_workflow
+
+      expect(database).to have_received(:system)
+        .with('ssh', '-o', 'StrictHostKeyChecking=no', '203.0.113.1', 'kill', '-0', '999999',
+              hash_including(:out, :err))
+    end
+
+    it 'steals a lock from another host once its owner is gone' do
+      database = described_class.new(databasefile)
+      database.dbopen
+      hold_lock(pid: 999_999, host: '203.0.113.1', age_seconds: 3600)
+      # A non-zero ssh probe means the owner is no longer running.
+      allow(database).to receive(:system).and_return(false)
+
+      expect(database.lock_workflow).to be true
+      expect(lock_owner).to eq(Process.pid)
+    end
+
+    it 'leaves a lock alone while its remote owner still answers' do
+      database = described_class.new(databasefile)
+      database.dbopen
+      hold_lock(pid: 999_999, host: '203.0.113.1', age_seconds: 3600)
+      # A zero exit means the owner is still running.
+      allow(database).to receive(:system).and_return(true)
+
+      expect(database.lock_workflow).to be false
+      expect(lock_owner).to eq(999_999)
+    end
+
     it 'properly locks and serializes database access across processes' do
       skip 'Flaky test with race conditions - needs redesign with proper IPC instead of sleep-based timing'
 
