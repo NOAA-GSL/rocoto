@@ -24,7 +24,9 @@ RSpec.describe 'PBS Professional integration', :pbs do
     saved_home = ENV.fetch('HOME', nil)
     ENV['HOME'] = File.join(work_dir, 'home')
     FileUtils.mkdir_p(ENV['HOME'])
-    example.run
+    # Run inside work_dir so job input/output files are written there.
+    Dir.chdir(work_dir) { example.run }
+  ensure
     ENV['HOME'] = saved_home
   end
 
