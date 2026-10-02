@@ -27,8 +27,8 @@ jobs:
         name: Run RuboCop
         run: bundle exec rubocop --format github
 
-  test-rocoto-amd64:
-    name: Ruby ${{ matrix.label }}
+  test-rocoto-slurm:
+    name: Slurm Ruby ${{ matrix.label }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
