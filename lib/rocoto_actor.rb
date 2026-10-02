@@ -5,6 +5,7 @@ require_relative "rocoto_actor/errors"
 require_relative "rocoto_actor/error_reporting"
 require_relative "rocoto_actor/threads"
 require_relative "rocoto_actor/protocol"
+require_relative "rocoto_actor/future"
 
 # RocotoActor runs each actor in its own operating-system process, behind a Unix
 # socket pair, so that a blocked or crashed actor cannot take the application
