@@ -1,0 +1,14 @@
+# RocotoActor was developed as a standalone library and names rescued
+# exceptions `error` throughout. That convention lives here rather than in the
+# root config because RuboCop cannot vary a cop's parameters by path, and the
+# two codebases are cleanly split: Rocoto rescues into `e` and never into
+# `error`, this library into `error` and never into `e`. One global setting
+# would leave one of them permanently in violation.
+#
+# inherit_from is load bearing. Without it this file would replace the root
+# config for this directory rather than merging with it, re-enabling the
+# Metrics cops the root config deliberately relaxes.
+inherit_from: ../../.rubocop.yml
+
+Naming/RescuedExceptionsVariableName:
+  PreferredName: error

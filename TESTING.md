@@ -96,4 +96,9 @@ bundle exec rubocop -a
 bundle exec rubocop -A
 ```
 
+**Do not run `-a` or `-A` across `lib/rocoto_actor/`.** Unsafe corrections there can
+rewrite exception handling, and autocorrect also deletes `# rubocop:disable` comments
+it judges redundant -- that directory relies on several of them deliberately. Lint it
+with `bundle exec rubocop lib/rocoto_actor` and fix any offenses by hand.
+
 Check `.rubocop.yml` for project-specific rules. Review all auto-corrected changes before committing.
