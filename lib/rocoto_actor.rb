@@ -5,6 +5,9 @@ require_relative "rocoto_actor/errors"
 require_relative "rocoto_actor/error_reporting"
 require_relative "rocoto_actor/threads"
 require_relative "rocoto_actor/protocol"
+require_relative "rocoto_actor/handle"
+require_relative "rocoto_actor/timer"
+require_relative "rocoto_actor/decode_bindings"
 require_relative "rocoto_actor/future"
 
 # RocotoActor runs each actor in its own operating-system process, behind a Unix
