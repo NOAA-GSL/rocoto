@@ -25,8 +25,10 @@ module RocotoActor
       @broker.ask(@id, message)
     end
 
-    # Blocks the caller until the broker answers. Two actors that call each
-    # other synchronously deadlock until their timeouts expire.
+    # Blocks the caller until the broker answers. Two actors that call each other
+    # synchronously do not hang: the broker tracks who is waiting on whom, so it
+    # finds the cycle and refuses the second call at once with DeadlockError,
+    # naming the path it found.
     def call(message, timeout: nil)
       return ask(message).value(timeout: timeout) if @broker
 
